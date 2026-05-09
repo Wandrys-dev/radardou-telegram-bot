@@ -535,7 +535,7 @@ async def cmd_alertas(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not items:
         await update.effective_message.reply_text(
             "Você não tem alertas configurados.\n\n"
-            "Crie alertas em https://www.radar-dou.com/alerts"
+            "Crie alertas em https://www.radar-dou.com/alertas"
         )
         return
 
@@ -615,7 +615,7 @@ async def cmd_ajuda(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "<code>data:01/05/2026-09/05/2026</code> — intervalo\n"
         "<code>desde:01/05/2026</code> — só data inicial\n\n"
         "<b>Notificações automáticas:</b>\n"
-        f"A cada {CHECK_ALERTS_INTERVAL_MIN} min eu checo seus alertas configurados em radar-dou.com/alerts e notifico aqui se houver novas publicações.\n"
+        f"A cada {CHECK_ALERTS_INTERVAL_MIN} min eu checo seus alertas configurados em radar-dou.com/alertas e notifico aqui se houver novas publicações.\n"
         "Liga/desliga em /menu.\n\n"
         "<b>Exemplos:</b>\n"
         "<code>concurso público</code>\n"
