@@ -1,0 +1,782 @@
+"""Bot Telegram para a API Radar DOU.
+
+Recursos:
+- /chave por usuario (cada um usa a propria API key)
+- Busca por orgao, secao, tipo, data via texto livre ou /buscar
+- Cards estilo site, paginacao com botao inline
+- /menu com botoes de açao rapida
+- Alertas proativos: a cada CHECK_ALERTS_INTERVAL_MIN o bot verifica os
+  alertas configurados de cada usuario na conta dele e notifica novos hits
+"""
+
+import logging
+import os
+import re
+from datetime import date, datetime, timedelta, timezone
+from html import escape
+
+from dotenv import load_dotenv
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
+
+from radardou import RadarDOU
+from storage import UserStorage
+
+# ---------------------------------------------------------------------------
+# Setup
+# ---------------------------------------------------------------------------
+
+load_dotenv()
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+DB_PATH = os.getenv("DATABASE_PATH", "bot_users.db")
+CHECK_ALERTS_INTERVAL_MIN = int(os.getenv("CHECK_ALERTS_INTERVAL_MIN", "30"))
+
+if not TOKEN:
+    raise SystemExit(
+        "TELEGRAM_BOT_TOKEN nao definido. Crie um .env a partir do .env.example."
+    )
+
+logging.basicConfig(
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    level=logging.INFO,
+)
+log = logging.getLogger("radardou-bot")
+
+storage = UserStorage(DB_PATH)
+API_KEY_RE = re.compile(r"^rdk_(prod|test)_[A-Za-z0-9]{32,}$")
+
+PAGE_SIZE = 5
+DEFAULT_LIMIT = 20
+
+SEARCH_STATE: dict[int, dict] = {}  # paginacao por chat_id
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def get_client(chat_id: int):
+    api_key = storage.get_api_key(chat_id)
+    if not api_key:
+        return None
+    return RadarDOU(api_key=api_key)
+
+
+def parse_filters(text: str) -> dict:
+    """Extrai filtros estilo 'orgao:Banco Central data:01/05/2026-08/05/2026'."""
+    text = re.sub(r"^[\s•·•\-\*]+", "", text or "")
+    text = re.sub(r"^/buscar\b\s*", "", text, flags=re.IGNORECASE).strip()
+
+    filters_out = {}
+    remaining = text
+
+    patterns = {
+        "orgao": r"orgao:\s*([^\s][^:]*?)(?=\s+\w+:|$)",
+        "secao": r"secao:\s*(DO\d|Extra)",
+        "tipo": r"tipo:\s*([^\s][^:]*?)(?=\s+\w+:|$)",
+        "data": r"data:\s*(\d{2}/\d{2}/\d{4})\s*-\s*(\d{2}/\d{2}/\d{4})",
+        "desde": r"desde:\s*(\d{2}/\d{2}/\d{4})",
+    }
+
+    m = re.search(patterns["data"], remaining, re.IGNORECASE)
+    if m:
+        filters_out["date_from"] = _br_to_iso(m.group(1))
+        filters_out["date_to"] = _br_to_iso(m.group(2))
+        remaining = remaining.replace(m.group(0), "").strip()
+
+    m = re.search(patterns["desde"], remaining, re.IGNORECASE)
+    if m:
+        filters_out["date_from"] = _br_to_iso(m.group(1))
+        remaining = remaining.replace(m.group(0), "").strip()
+
+    for key in ["orgao", "secao", "tipo"]:
+        m = re.search(patterns[key], remaining, re.IGNORECASE)
+        if m:
+            filters_out[key] = m.group(1).strip()
+            remaining = remaining.replace(m.group(0), "").strip()
+
+    query = remaining.strip()
+    if query:
+        filters_out["query"] = query
+
+    return filters_out
+
+
+def _br_to_iso(date_br: str) -> str:
+    d, m, y = date_br.split("/")
+    return f"{y}-{m}-{d}"
+
+
+def _iso_to_br(date_iso: str) -> str:
+    if not date_iso:
+        return ""
+    if "T" in date_iso:
+        date_iso = date_iso.split("T", 1)[0]
+    parts = date_iso.split("-")
+    if len(parts) == 3:
+        return f"{parts[2]}/{parts[1]}/{parts[0]}"
+    return date_iso
+
+
+def html_card(pub: dict) -> str:
+    titulo = escape(pub.get("titulo") or "(sem titulo)")
+    secao = escape(pub.get("secao_codigo") or "?")
+    tipo = escape(pub.get("tipo_ato") or "")
+    orgao_full = pub.get("orgao_hierarquia") or ""
+    orgao_curto = orgao_full.split("/")[-1] if orgao_full else ""
+    orgao_curto = escape(orgao_curto[:80])
+    data_pub = _iso_to_br(pub.get("data_publicacao") or "")
+    pagina = pub.get("numero_pagina") or ""
+    link = pub.get("link_ato") or ""
+    resumo = pub.get("texto_resumo") or ""
+    if resumo:
+        resumo = escape(resumo[:250] + ("..." if len(resumo) > 250 else ""))
+
+    parts = [f"<b>{titulo}</b>"]
+    badges = []
+    if secao and secao != "?":
+        badges.append(f"📋 {secao}")
+    if tipo:
+        badges.append(f"📄 {tipo}")
+    if data_pub:
+        badges.append(f"📅 {data_pub}")
+    if pagina:
+        badges.append(f"📑 pág. {pagina}")
+    if badges:
+        parts.append(" • ".join(badges))
+    if orgao_curto:
+        parts.append(f"🏛️ <i>{orgao_curto}</i>")
+    if resumo:
+        parts.append(resumo)
+    if link:
+        parts.append(f'🔗 <a href="{escape(link, quote=True)}">Ler ato completo</a>')
+    return "\n".join(parts)
+
+
+def search_summary(filters_used: dict, total: int, shown_count: int, page: int) -> str:
+    lines = ["<b>🔍 Busca no DOU</b>"]
+    if filters_used.get("query"):
+        lines.append(f'• Termo: <i>{escape(filters_used["query"])}</i>')
+    if filters_used.get("orgao"):
+        lines.append(f'• Órgão: <i>{escape(filters_used["orgao"])}</i>')
+    if filters_used.get("secao"):
+        lines.append(f'• Seção: <i>{escape(filters_used["secao"])}</i>')
+    if filters_used.get("tipo"):
+        lines.append(f'• Tipo: <i>{escape(filters_used["tipo"])}</i>')
+    if filters_used.get("date_from") or filters_used.get("date_to"):
+        df = _iso_to_br(filters_used.get("date_from") or "")
+        dt = _iso_to_br(filters_used.get("date_to") or "")
+        if df and dt:
+            lines.append(f"• Período: {df} até {dt}")
+        elif df:
+            lines.append(f"• Desde: {df}")
+    lines.append("")
+    lines.append(f"📊 <b>Total no banco:</b> {total} | <b>Mostrando:</b> {shown_count} (pág {page + 1})")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Comandos
+# ---------------------------------------------------------------------------
+
+
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    has_key = storage.get_api_key(chat_id) is not None
+    name = update.effective_user.first_name or "voce"
+
+    txt = (
+        f"Olá, {name}! Eu sou o bot do <b>Radar DOU</b>.\n\n"
+        "Eu busco publicações do Diário Oficial da União pra você, "
+        "com filtros por órgão, data, seção e tipo. Notifico automaticamente "
+        "quando novos atos batem com seus alertas.\n\n"
+    )
+    if has_key:
+        txt += (
+            "Você já tem uma chave cadastrada ✅\n\n"
+            "<b>Como usar:</b>\n"
+            "• Digite qualquer termo (ex: <i>concurso público</i>) → busco direto\n"
+            "• Use filtros: <code>orgao:Banco Central data:01/05/2026-09/05/2026</code>\n"
+            "• /menu — abre menu de ações rápidas\n"
+            "• /ajuda — ver todos os comandos e exemplos"
+        )
+    else:
+        txt += (
+            "Pra começar, você precisa de uma chave de API.\n\n"
+            "1️⃣ Crie em https://www.radar-dou.com/api-keys\n"
+            "    👉 Marque <b>todos os scopes</b> pra todas as funcionalidades\n"
+            "2️⃣ Cadastre aqui com:\n"
+            "    <code>/chave rdk_prod_sua_chave</code>\n\n"
+            "Plano trial gratuito de 5 dias disponível."
+        )
+    await update.message.reply_html(txt, disable_web_page_preview=True)
+
+
+def main_menu_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("📅 Hoje", callback_data="menu:hoje"),
+            InlineKeyboardButton("🗓️ 7 dias", callback_data="menu:7d"),
+            InlineKeyboardButton("📆 30 dias", callback_data="menu:30d"),
+        ],
+        [
+            InlineKeyboardButton("🔔 Alertas", callback_data="menu:alertas"),
+            InlineKeyboardButton("⭐ Favoritos", callback_data="menu:favoritos"),
+        ],
+        [
+            InlineKeyboardButton("🔕 Notif: ?", callback_data="menu:toggle_notif"),
+            InlineKeyboardButton("ℹ️ Ajuda", callback_data="menu:ajuda"),
+        ],
+    ])
+
+
+async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    notif_on = storage.get_notifications(chat_id)
+
+    kb = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("📅 Hoje", callback_data="menu:hoje"),
+            InlineKeyboardButton("🗓️ Últimos 7 dias", callback_data="menu:7d"),
+        ],
+        [
+            InlineKeyboardButton("📆 Últimos 30 dias", callback_data="menu:30d"),
+        ],
+        [
+            InlineKeyboardButton("🔔 Meus alertas", callback_data="menu:alertas"),
+            InlineKeyboardButton("⭐ Favoritos", callback_data="menu:favoritos"),
+        ],
+        [
+            InlineKeyboardButton(
+                ("🔕 Desligar notif" if notif_on else "🔔 Ligar notif"),
+                callback_data="menu:toggle_notif",
+            ),
+            InlineKeyboardButton("ℹ️ Ajuda", callback_data="menu:ajuda"),
+        ],
+    ])
+
+    txt = (
+        "<b>Menu — Radar DOU</b>\n\n"
+        f"🔔 Notificações automáticas: {'<b>LIGADAS</b>' if notif_on else 'desligadas'}\n"
+        "Quando ligadas, você recebe alertas a cada "
+        f"{CHECK_ALERTS_INTERVAL_MIN} min com novas publicações que batem "
+        "com os alertas configurados na sua conta Radar DOU.\n\n"
+        "Pra busca direta, é só digitar o termo no chat."
+    )
+    await update.message.reply_html(txt, reply_markup=kb)
+
+
+async def cmd_chave(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    if not context.args:
+        await update.message.reply_text(
+            "Uso: /chave rdk_prod_sua_chave_aqui\n\n"
+            "Crie a chave em https://www.radar-dou.com/api-keys"
+        )
+        return
+
+    api_key = context.args[0].strip()
+    if not API_KEY_RE.match(api_key):
+        await update.message.reply_text(
+            "Formato de chave inválido. Deve começar com rdk_prod_ ou rdk_test_."
+        )
+        return
+
+    await update.message.reply_text("Validando chave...")
+    try:
+        client = RadarDOU(api_key=api_key)
+        client.buscar(date_from=date.today().isoformat(), limit=1)
+        client.close()
+    except Exception as exc:
+        log.warning("validacao falhou: %s", exc)
+        await update.message.reply_text(
+            f"Chave inválida ou plano expirado.\n\nDetalhe: {exc}"
+        )
+        return
+
+    storage.set_api_key(chat_id, api_key)
+    storage.set_notifications(chat_id, True)
+    storage.set_last_alert_check(chat_id)  # reset baseline = agora
+
+    try:
+        await update.message.delete()
+    except Exception:
+        pass
+
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=(
+            "Chave cadastrada com sucesso ✅\n\n"
+            "Apaguei sua mensagem com a chave por segurança.\n\n"
+            "<b>Notificações automáticas ligadas</b> 🔔 — vou checar seus alertas "
+            f"a cada {CHECK_ALERTS_INTERVAL_MIN} min.\n\n"
+            "Experimente: /menu ou digite <code>orgao:Banco Central</code>"
+        ),
+        parse_mode="HTML",
+    )
+
+
+async def cmd_revogar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    storage.delete_user(chat_id)
+    SEARCH_STATE.pop(chat_id, None)
+    await update.message.reply_text(
+        "Sua chave foi removida do bot. Pode cadastrar nova com /chave."
+    )
+
+
+async def cmd_hoje(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    hoje_str = date.today().isoformat()
+    await _do_search(update, context, chat_id, {"date_from": hoje_str}, page=0)
+
+
+async def cmd_buscar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_html(
+            "<b>Uso:</b> <code>/buscar &lt;termo&gt; [filtros]</code>\n\n"
+            "<b>Exemplos (clique pra copiar):</b>\n"
+            "<code>/buscar concurso público</code>\n"
+            "<code>/buscar orgao:Banco Central</code>\n"
+            "<code>/buscar licitação data:01/05/2026-09/05/2026</code>\n"
+            "<code>/buscar edital secao:DO3 tipo:Edital</code>\n\n"
+            "Dica: sem o <code>/buscar</code> também funciona — é só digitar o termo direto."
+        )
+        return
+    text = " ".join(context.args)
+    await _do_search_from_text(update, context, text)
+
+
+async def on_plain_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (update.message.text or "").strip()
+    if not text:
+        return
+    await _do_search_from_text(update, context, text)
+
+
+async def _do_search_from_text(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
+    chat_id = update.effective_chat.id
+    filters_parsed = parse_filters(text)
+
+    if not any(filters_parsed.get(k) for k in ("date_from", "date_to", "orgao", "secao", "tipo")):
+        filters_parsed["date_from"] = (date.today() - timedelta(days=7)).isoformat()
+
+    await _do_search(update, context, chat_id, filters_parsed, page=0)
+
+
+async def _do_search(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                     chat_id: int, filters_used: dict, page: int):
+    client = get_client(chat_id)
+    if not client:
+        await update.effective_message.reply_text(
+            "Cadastre sua chave primeiro: /chave rdk_prod_xxx"
+        )
+        return
+
+    try:
+        result = client.buscar(
+            **{k: v for k, v in filters_used.items() if k in
+               ("query", "orgao", "secao", "tipo", "date_from", "date_to")},
+            page=page + 1,
+            limit=DEFAULT_LIMIT,
+        )
+    except Exception as exc:
+        msg = str(exc)
+        log.exception("erro na busca")
+        if "permiss" in msg.lower() or "scope" in msg.lower():
+            await update.effective_message.reply_html(
+                "Sua chave não tem permissão para essa busca.\n\n"
+                "Crie nova chave em https://www.radar-dou.com/api-keys "
+                "marcando <code>publications:read</code>."
+            )
+            return
+        await update.effective_message.reply_text(f"Erro ao buscar: {exc}")
+        return
+    finally:
+        client.close()
+
+    total = result["pagination"]["total"]
+    items = result["data"]
+
+    if total == 0:
+        await update.effective_message.reply_html(
+            search_summary(filters_used, 0, 0, page) + "\n\n<i>Nenhum resultado.</i>"
+        )
+        return
+
+    SEARCH_STATE[chat_id] = {
+        "filters": filters_used,
+        "page": page,
+        "total": total,
+        "shown": len(items),
+    }
+
+    header = search_summary(filters_used, total, len(items), page)
+    await update.effective_message.reply_html(header, disable_web_page_preview=True)
+
+    chunks = [items[i:i + PAGE_SIZE] for i in range(0, len(items), PAGE_SIZE)]
+    for chunk in chunks:
+        body = "\n\n────────\n\n".join(html_card(p) for p in chunk)
+        await update.effective_message.reply_html(body, disable_web_page_preview=True)
+
+    total_pages = -(-total // DEFAULT_LIMIT)
+    if page + 1 < total_pages:
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton(
+                f"⏭️ Próximas {DEFAULT_LIMIT} (pág {page + 2}/{total_pages})",
+                callback_data=f"page:{page + 1}",
+            )
+        ]])
+        await update.effective_message.reply_text(
+            f"Página {page + 1} de {total_pages}.",
+            reply_markup=kb,
+        )
+
+
+async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Roteia todos os clicks em botoes inline."""
+    query = update.callback_query
+    await query.answer()
+    chat_id = query.message.chat.id
+    data = query.data or ""
+
+    if data.startswith("page:"):
+        state = SEARCH_STATE.get(chat_id)
+        if not state:
+            await query.message.reply_text("Sessão expirou. Faça uma nova busca.")
+            return
+        next_page = int(data.split(":", 1)[1])
+        fake = Update(update.update_id, message=query.message)
+        await _do_search(fake, context, chat_id, state["filters"], page=next_page)
+        return
+
+    if data == "menu:hoje":
+        fake = Update(update.update_id, message=query.message)
+        await _do_search(fake, context, chat_id, {"date_from": date.today().isoformat()}, page=0)
+        return
+
+    if data == "menu:7d":
+        fake = Update(update.update_id, message=query.message)
+        df = (date.today() - timedelta(days=7)).isoformat()
+        await _do_search(fake, context, chat_id, {"date_from": df}, page=0)
+        return
+
+    if data == "menu:30d":
+        fake = Update(update.update_id, message=query.message)
+        df = (date.today() - timedelta(days=30)).isoformat()
+        await _do_search(fake, context, chat_id, {"date_from": df}, page=0)
+        return
+
+    if data == "menu:alertas":
+        fake = Update(update.update_id, message=query.message)
+        await cmd_alertas(fake, context)
+        return
+
+    if data == "menu:favoritos":
+        fake = Update(update.update_id, message=query.message)
+        await cmd_favoritos(fake, context)
+        return
+
+    if data == "menu:toggle_notif":
+        atual = storage.get_notifications(chat_id)
+        novo = not atual
+        storage.set_notifications(chat_id, novo)
+        if novo:
+            storage.set_last_alert_check(chat_id)
+        await query.message.reply_html(
+            f"Notificações automáticas: <b>{'LIGADAS' if novo else 'desligadas'}</b> "
+            f"{'🔔' if novo else '🔕'}"
+        )
+        return
+
+    if data == "menu:ajuda":
+        fake = Update(update.update_id, message=query.message)
+        await cmd_ajuda(fake, context)
+        return
+
+
+async def cmd_alertas(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    client = get_client(chat_id)
+    if not client:
+        await update.effective_message.reply_text(
+            "Cadastre sua chave primeiro: /chave rdk_prod_xxx"
+        )
+        return
+
+    try:
+        result = client.listar_alertas()
+    except Exception as exc:
+        msg = str(exc)
+        if "permiss" in msg.lower() or "permission" in msg.lower() or "scope" in msg.lower():
+            await update.effective_message.reply_html(
+                "Sua chave de API <b>não tem permissão</b> para alertas.\n\n"
+                "Pra liberar:\n"
+                "1️⃣ Vá em https://www.radar-dou.com/api-keys\n"
+                "2️⃣ Crie uma <b>nova chave</b> marcando <code>alerts:read</code> "
+                "(ou clique em <i>Marcar todos</i>)\n"
+                "3️⃣ Cadastre aqui com /chave &lt;nova_chave&gt;"
+            )
+            return
+        log.exception("erro em /alertas")
+        await update.effective_message.reply_text(f"Erro: {exc}")
+        return
+    finally:
+        client.close()
+
+    items = result.get("data", []) if isinstance(result, dict) else result
+    if not items:
+        await update.effective_message.reply_text(
+            "Você não tem alertas configurados.\n\n"
+            "Crie alertas em https://www.radar-dou.com/alerts"
+        )
+        return
+
+    lines = ["<b>Seus alertas configurados:</b>\n"]
+    for alert in items[:20]:
+        nome = escape(alert.get("name", "(sem nome)"))
+        freq = escape(alert.get("frequency", "?"))
+        ativo = "✅" if alert.get("active", True) else "❌"
+        lines.append(f"{ativo} <b>{nome}</b> — {freq}")
+    notif_on = storage.get_notifications(chat_id)
+    lines.append("")
+    lines.append(
+        f"🔔 Notificações automáticas: <b>{'ON' if notif_on else 'OFF'}</b> — /menu pra alternar"
+    )
+    await update.effective_message.reply_html("\n".join(lines))
+
+
+async def cmd_favoritos(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    client = get_client(chat_id)
+    if not client:
+        await update.effective_message.reply_text(
+            "Cadastre sua chave primeiro: /chave rdk_prod_xxx"
+        )
+        return
+
+    try:
+        result = client.listar_favoritos()
+    except Exception as exc:
+        msg = str(exc)
+        if "permiss" in msg.lower() or "permission" in msg.lower() or "scope" in msg.lower():
+            await update.effective_message.reply_html(
+                "Sua chave de API <b>não tem permissão</b> para favoritos.\n\n"
+                "Crie nova chave em https://www.radar-dou.com/api-keys marcando "
+                "<code>favorites:read</code>."
+            )
+            return
+        log.exception("erro em /favoritos")
+        await update.effective_message.reply_text(f"Erro: {exc}")
+        return
+    finally:
+        client.close()
+
+    items = result.get("data", []) if isinstance(result, dict) else result
+    if not items:
+        await update.effective_message.reply_text(
+            "Você ainda não tem publicações favoritas.\n\n"
+            "Salve favoritos em https://www.radar-dou.com"
+        )
+        return
+
+    pubs = [it.get("publication") or it for it in items[:10]]
+    chunks = [pubs[i:i + PAGE_SIZE] for i in range(0, len(pubs), PAGE_SIZE)]
+    await update.effective_message.reply_html(f"<b>Seus {len(pubs)} favoritos mais recentes:</b>")
+    for chunk in chunks:
+        body = "\n\n────────\n\n".join(html_card(p) for p in chunk)
+        await update.effective_message.reply_html(body, disable_web_page_preview=True)
+
+
+async def cmd_ajuda(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    txt = (
+        "<b>Bot do Radar DOU — Comandos</b>\n\n"
+        "<b>Cadastro:</b>\n"
+        "/start — boas-vindas e status\n"
+        "/chave &lt;api_key&gt; — cadastra/atualiza sua chave\n"
+        "/revogar — remove sua chave deste bot\n\n"
+        "<b>Consulta:</b>\n"
+        "/menu — abre menu rápido com botões\n"
+        "/hoje — publicações de hoje\n"
+        "/buscar &lt;termo&gt; [filtros] — busca avançada\n"
+        "/alertas — lista seus alertas configurados\n"
+        "/favoritos — lista suas publicações favoritas\n\n"
+        "<b>Filtros (formato chave:valor):</b>\n"
+        "<code>orgao:Banco Central</code> — match parcial no nome do órgão\n"
+        "<code>secao:DO1</code> — DO1, DO2, DO3 ou Extra\n"
+        "<code>tipo:Portaria</code> — Portaria, Edital, Despacho etc.\n"
+        "<code>data:01/05/2026-09/05/2026</code> — intervalo\n"
+        "<code>desde:01/05/2026</code> — só data inicial\n\n"
+        "<b>Notificações automáticas:</b>\n"
+        f"A cada {CHECK_ALERTS_INTERVAL_MIN} min eu checo seus alertas configurados em radar-dou.com/alerts e notifico aqui se houver novas publicações.\n"
+        "Liga/desliga em /menu.\n\n"
+        "<b>Exemplos:</b>\n"
+        "<code>concurso público</code>\n"
+        "<code>orgao:Banco Central data:01/05/2026-09/05/2026</code>\n"
+        "<code>edital orgao:Tribunal de Contas secao:DO3</code>\n\n"
+        "Site: https://www.radar-dou.com"
+    )
+    await update.effective_message.reply_html(txt, disable_web_page_preview=True)
+
+
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
+    log.exception("Exception while handling update", exc_info=context.error)
+
+
+# ---------------------------------------------------------------------------
+# Job proativo de alertas
+# ---------------------------------------------------------------------------
+
+
+async def check_alerts_job(context: ContextTypes.DEFAULT_TYPE):
+    """Roda a cada CHECK_ALERTS_INTERVAL_MIN. Para cada usuario com notif ON,
+    busca os alertas configurados e checa se ha novas publicacoes desde o
+    ultimo check. Notifica via Telegram."""
+    log.info("[alerts-job] iniciando ciclo")
+
+    users = storage.list_users_for_alerts()
+    log.info("[alerts-job] %d usuarios para checar", len(users))
+
+    for chat_id, api_key, last_check_iso in users:
+        try:
+            await _check_alerts_for_user(context, chat_id, api_key, last_check_iso)
+        except Exception as exc:
+            log.exception("[alerts-job] erro com chat_id=%s: %s", chat_id, exc)
+
+    log.info("[alerts-job] ciclo concluido")
+
+
+async def _check_alerts_for_user(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    api_key: str,
+    last_check_iso: str | None,
+):
+    client = RadarDOU(api_key=api_key)
+    try:
+        try:
+            res = client.listar_alertas()
+        except Exception as exc:
+            msg = str(exc).lower()
+            if "permiss" in msg or "scope" in msg:
+                log.info("[alerts-job] chat_id=%s sem permissao de alertas", chat_id)
+                return
+            raise
+
+        alerts = res.get("data", []) if isinstance(res, dict) else res
+        active = [a for a in (alerts or []) if a.get("active", True)]
+        if not active:
+            return
+
+        # Janela: de last_check_iso (ou ultimas 2h se nunca checou) ate agora
+        if last_check_iso:
+            try:
+                df = datetime.fromisoformat(last_check_iso.replace("Z", "+00:00")).date().isoformat()
+            except Exception:
+                df = date.today().isoformat()
+        else:
+            df = date.today().isoformat()
+
+        for alert in active:
+            crit = alert.get("searchCriteria") or alert.get("search_criteria") or {}
+            kwargs = {"date_from": df, "limit": 5}
+            if crit.get("query"):
+                kwargs["query"] = crit["query"]
+            if crit.get("secao"):
+                kwargs["secao"] = crit["secao"]
+            if crit.get("tipo"):
+                kwargs["tipo"] = crit["tipo"]
+            if crit.get("orgao"):
+                kwargs["orgao"] = crit["orgao"]
+
+            # Sem nenhum criterio = nao busca (evita scan)
+            if not any(k in kwargs for k in ("query", "secao", "tipo", "orgao")):
+                continue
+
+            try:
+                hits = client.buscar(**kwargs)
+            except Exception as exc:
+                log.warning("[alerts-job] alerta '%s' falhou: %s", alert.get("name"), exc)
+                continue
+
+            items = hits.get("data") or []
+            if not items:
+                continue
+
+            nome = escape(alert.get("name") or "(alerta)")
+            header = f"🔔 <b>Alerta: {nome}</b>\n{len(items)} nova(s) publicação(ões):"
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=header,
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+            )
+            for pub in items[:5]:
+                try:
+                    await context.bot.send_message(
+                        chat_id=chat_id,
+                        text=html_card(pub),
+                        parse_mode="HTML",
+                        disable_web_page_preview=True,
+                    )
+                except Exception as exc:
+                    log.warning("[alerts-job] envio falhou: %s", exc)
+
+        storage.set_last_alert_check(chat_id)
+    finally:
+        try:
+            client.close()
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+
+def main():
+    app = Application.builder().token(TOKEN).build()
+
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("menu", cmd_menu))
+    app.add_handler(CommandHandler("chave", cmd_chave))
+    app.add_handler(CommandHandler("revogar", cmd_revogar))
+    app.add_handler(CommandHandler("hoje", cmd_hoje))
+    app.add_handler(CommandHandler("buscar", cmd_buscar))
+    app.add_handler(CommandHandler("alertas", cmd_alertas))
+    app.add_handler(CommandHandler("favoritos", cmd_favoritos))
+    app.add_handler(CommandHandler("ajuda", cmd_ajuda))
+    app.add_handler(CommandHandler("help", cmd_ajuda))
+
+    app.add_handler(CallbackQueryHandler(on_callback))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_plain_text))
+
+    app.add_error_handler(on_error)
+
+    # Job proativo de alertas
+    interval_seconds = CHECK_ALERTS_INTERVAL_MIN * 60
+    app.job_queue.run_repeating(
+        check_alerts_job,
+        interval=interval_seconds,
+        first=60,  # primeiro check 60s apos start (warmup)
+        name="check_alerts",
+    )
+
+    log.info(
+        "Bot iniciando. Usuarios cadastrados: %d. Job de alertas a cada %d min.",
+        storage.count_users(),
+        CHECK_ALERTS_INTERVAL_MIN,
+    )
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
+
+
+if __name__ == "__main__":
+    main()

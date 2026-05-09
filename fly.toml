@@ -1,0 +1,25 @@
+# Configuração Fly.io para o bot Telegram do Radar DOU.
+# Use:  fly launch --copy-config  (ou fly deploy se ja inicializou)
+
+app = "radardou-telegram-bot"
+primary_region = "gru"  # São Paulo
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  DATABASE_PATH = "/data/bot_users.db"
+  CHECK_ALERTS_INTERVAL_MIN = "30"
+
+# Volume persistente para o SQLite
+[mounts]
+  source = "bot_data"
+  destination = "/data"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "256mb"
+
+# Bot usa long polling, nao precisa de http checks ou portas
+[processes]
+  app = "python -u bot.py"

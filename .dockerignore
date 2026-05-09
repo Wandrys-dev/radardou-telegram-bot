@@ -1,0 +1,14 @@
+.venv/
+venv/
+.env
+*.db
+*.db-journal
+__pycache__/
+*.pyc
+*.pyo
+.git/
+.gitignore
+.idea/
+.vscode/
+.pytest_cache/
+README.md
