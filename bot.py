@@ -743,6 +743,13 @@ ESTRATEGIA DE BUSCA (CRITICO):
   Esses filtros casam com tipo_ato no banco e dao resultados PRECISOS, igual a aba
   /concursos do site (so traz Editais de Concurso, nao Portarias que mencionam concurso).
 
+- Para FILTRAR POR FASE do edital, use o param 'fase':
+  - "abertura" / "novos editais" → fase="abertura"
+  - "resultado" → fase="resultado"
+  - "homologacao" → fase="homologacao"
+  - "retificacao" → fase="retificacao"
+  - "prorrogacao" → fase="prorrogacao"
+
 - Para BUSCA TEXTUAL livre, use 'query' (procura em titulo + corpo):
   - Use termos CURTOS — o DOU nao tem stemming, "concursos" != "concurso".
   - "portarias do MEC" → orgao="Ministerio da Educacao", tipo="Portaria" (sem query)
@@ -750,6 +757,19 @@ ESTRATEGIA DE BUSCA (CRITICO):
 - Use 'orgao' pra match parcial no nome do orgao (ex: "Banco Central").
 - Se a busca trouxer 0 resultados, REPORTE 0 honestamente — NAO ample sozinho.
   Apenas SUGIRA ao usuario que ele aumente o periodo ou tente outra categoria.
+
+CARRYOVER DE FILTROS NO HISTORICO (CRITICO):
+- Filtros OPCIONAIS (fase, query, orgao, tipo) NAO devem ser herdados de
+  turnos anteriores. Use-os APENAS se o usuario mencionar explicitamente na
+  mensagem ATUAL. Ignorar essa regra leva a respostas erradas.
+- Filtros ESSENCIAIS (categoria, date_from/date_to) podem ser mantidos se
+  fizerem sentido no contexto da conversa.
+- Quando o usuario disser "amplia", "expande", "ve tudo", "sem filtrar",
+  "geral", REMOVA todos os filtros opcionais e mantenha so os essenciais.
+- Exemplo: se ele perguntou antes "so editais de abertura" e agora pede
+  "amplia pros ultimos 7 dias", essa nova chamada NAO deve ter fase=abertura
+  — eh um pedido GENERICO de ampliacao. Se ele quiser refinar de novo,
+  ele vai dizer "agora so abertura".
 
 FORMATACAO DA RESPOSTA AO USUARIO (CRITICO):
 - NUNCA mostre IDs numericos das publicacoes no texto da resposta. Eles sao usados internamente.
