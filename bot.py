@@ -686,24 +686,34 @@ REGRAS GERAIS:
 4. Se a pergunta for vaga, peca pra esclarecer ANTES de buscar.
 5. Se o usuario pedir algo fora do escopo do DOU, redirecione gentilmente.
 
-INTERPRETACAO DE EXPRESSOES DE TEMPO (use date_from/date_to):
-- "hoje" → date_from e date_to = data de HOJE (mesmo valor)
-- "ontem" → date_from e date_to = ontem
-- "esta semana" / "nesta semana" / "this week" → date_from = primeira segunda-feira da semana atual ATE hoje
-- "ultimos 7 dias" / "ultima semana" → date_from = HOJE - 7 dias
-- "este mes" / "neste mes" → date_from = primeiro dia do mes atual ATE hoje
-- "ultimos 30 dias" / "ultimo mes" → date_from = HOJE - 30 dias
-- "no dia DD/MM" → date_from = date_to = essa data
+INTERPRETACAO DE EXPRESSOES DE TEMPO (convencao brasileira: semana comeca no DOMINGO):
+- "hoje" → date_from = date_to = HOJE
+- "ontem" → date_from = date_to = HOJE - 1 dia
+- "esta semana" / "nesta semana" → date_from = ULTIMO DOMINGO (inclusive); date_to = HOJE
+  IMPORTANTE: se HOJE for domingo, date_from = HOJE (a semana esta comecando)
+- "semana passada" → date_from = domingo de 7 dias atras; date_to = sabado anterior a HOJE
+- "ultimos 7 dias" → date_from = HOJE - 7; date_to = HOJE
+- "este mes" → date_from = dia 1 do mes atual; date_to = HOJE
+- "ultimos 30 dias" → date_from = HOJE - 30
+- "no dia DD/MM/AAAA" → date_from = date_to = essa data
 - "entre X e Y" → date_from = X, date_to = Y
-- Se o usuario nao especificou periodo, use date_from = HOJE - 7 dias.
+- Se o usuario NAO especificou periodo, use date_from = HOJE - 7 dias.
 
-ESTRATEGIA DE QUERY:
-- Use termos CURTOS e GENERICOS pra maximizar matches:
-  - "concurso publico" / "concursos" → query="concurso"
-  - "licitacoes" → query="licitacao"
-  - "editais" → query="edital"
-  - "portarias do MEC" → query=None, orgao="Ministerio da Educacao", tipo="Portaria"
-- Se a primeira busca trouxer 0 resultados, AMPLIE (query mais curta OU periodo maior).
+ESTRATEGIA DE BUSCA (CRITICO):
+- Para CATEGORIAS especiais, use o param 'categoria' (NAO use query):
+  - "concurso publico" / "concursos" / "editais de concurso" → categoria="concursos"
+  - "licitacoes" / "pregoes" → categoria="licitacoes"
+  - "leis" / "decretos" / "medidas provisorias" → categoria="legislacao"
+  Esses filtros casam com tipo_ato no banco e dao resultados PRECISOS, igual a aba
+  /concursos do site (so traz Editais de Concurso, nao Portarias que mencionam concurso).
+
+- Para BUSCA TEXTUAL livre, use 'query' (procura em titulo + corpo):
+  - Use termos CURTOS — o DOU nao tem stemming, "concursos" != "concurso".
+  - "portarias do MEC" → orgao="Ministerio da Educacao", tipo="Portaria" (sem query)
+
+- Use 'orgao' pra match parcial no nome do orgao (ex: "Banco Central").
+- Se a primeira busca trouxer 0 resultados, AMPLIE: aumente periodo OU troque
+  categoria por query (ou vice-versa), OU use sinonimos.
 
 FORMATACAO DA RESPOSTA AO USUARIO (CRITICO):
 - NUNCA mostre IDs numericos das publicacoes no texto da resposta. Eles sao usados internamente.
@@ -726,7 +736,11 @@ AI_TOOLS = [
             "name": "buscar_publicacoes",
             "description": (
                 "Busca publicacoes no Diario Oficial da Uniao. Pelo menos um filtro eh "
-                "obrigatorio entre query, date_from, date_to, secao, tipo, orgao."
+                "obrigatorio entre query, date_from, date_to, secao, tipo, orgao ou categoria. "
+                "Para 'concursos publicos', 'licitacoes' ou 'leis/decretos', PREFIRA usar "
+                "o parametro 'categoria' em vez de 'query' — eh mais preciso pq filtra "
+                "tipo_ato no banco (mesma logica das paginas /concursos, /licitacoes, /legislacao "
+                "do site)."
             ),
             "parameters": {
                 "type": "object",
@@ -737,6 +751,16 @@ AI_TOOLS = [
                     "secao": {"type": "string", "enum": ["DO1", "DO2", "DO3", "Extra"]},
                     "tipo": {"type": "string", "description": "Tipo do ato (ex: Portaria, Edital, Despacho, Decreto)"},
                     "orgao": {"type": "string", "description": "Match parcial no nome do orgao (ex: 'Banco Central')"},
+                    "categoria": {
+                        "type": "string",
+                        "enum": ["concursos", "licitacoes", "legislacao"],
+                        "description": (
+                            "Categoria especializada — filtra por tipo_ato. "
+                            "Use 'concursos' pra editais de concurso publico, "
+                            "'licitacoes' pra pregoes/licitacoes, "
+                            "'legislacao' pra leis/decretos/MPs."
+                        ),
+                    },
                     "limit": {"type": "integer", "default": 5, "minimum": 1, "maximum": 20},
                 },
             },
