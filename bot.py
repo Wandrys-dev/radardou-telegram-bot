@@ -1631,7 +1631,10 @@ async def _check_alerts_for_user(
 
         for alert in active:
             crit = alert.get("searchCriteria") or alert.get("search_criteria") or {}
-            kwargs = {"date_from": df, "limit": 5}
+            # Pegamos um lote maior pra ter folga no filtro de dedup. Sem isso,
+            # se o usuario ja viu as 5 mais recentes mas o alerta tem 8 hits,
+            # ele nao recebe as 3 que ainda nao viu.
+            kwargs = {"date_from": df, "limit": 50}
             if crit.get("query"):
                 kwargs["query"] = crit["query"]
             if crit.get("secao"):
@@ -1655,15 +1658,35 @@ async def _check_alerts_for_user(
             if not items:
                 continue
 
+            # DEDUP: filtra pubs que ja foram notificadas pra esse (chat, alerta).
+            # Mesmo padrao da AlertNotification da app web — cada par
+            # (alert_id, publicacao_id) eh notificada uma unica vez.
+            alert_id = int(alert.get("id") or 0)
+            pub_ids = [str(p.get("id")) for p in items if p.get("id") is not None]
+            unnotified = storage.filter_unnotified_pubs(chat_id, alert_id, pub_ids)
+            new_items = [p for p in items if str(p.get("id")) in unnotified]
+
+            if not new_items:
+                continue
+
+            # Limita o card-blast a 5 por ciclo, mas marca todos como notificados
+            # pra que ciclos seguintes mostrem os proximos.
+            to_send = new_items[:5]
             nome = escape(alert.get("name") or "(alerta)")
-            header = f"🔔 <b>Alerta: {nome}</b>\n{len(items)} nova(s) publicação(ões):"
+            extra_count = len(new_items) - len(to_send)
+            extra = f" (+{extra_count} mais no proximo ciclo)" if extra_count > 0 else ""
+            header = (
+                f"🔔 <b>Alerta: {nome}</b>\n"
+                f"{len(new_items)} nova(s) publicação(ões){extra}:"
+            )
             await context.bot.send_message(
                 chat_id=chat_id,
                 text=header,
                 parse_mode="HTML",
                 disable_web_page_preview=True,
             )
-            for pub in items[:5]:
+            sent_ids: list[str] = []
+            for pub in to_send:
                 try:
                     await context.bot.send_message(
                         chat_id=chat_id,
@@ -1671,8 +1694,15 @@ async def _check_alerts_for_user(
                         parse_mode="HTML",
                         disable_web_page_preview=True,
                     )
+                    if pub.get("id") is not None:
+                        sent_ids.append(str(pub["id"]))
                 except Exception as exc:
                     log.warning("[alerts-job] envio falhou: %s", exc)
+
+            # Marca como notificado APENAS as que conseguiu enviar com sucesso
+            # — assim, falhas transitorias ainda terao retry no proximo ciclo.
+            if sent_ids:
+                storage.mark_notified(chat_id, alert_id, sent_ids)
 
         storage.set_last_alert_check(chat_id)
     finally:
@@ -1765,6 +1795,22 @@ def main():
         interval=interval_seconds,
         first=60,  # primeiro check 60s apos start (warmup)
         name="check_alerts",
+    )
+
+    # Cleanup diario da tabela de dedup (mantem so 90 dias)
+    async def _cleanup_job(_ctx):
+        try:
+            removed = storage.cleanup_old_notifications(days=90)
+            if removed:
+                log.info("[cleanup] removidas %d notificacoes com >90 dias", removed)
+        except Exception as exc:
+            log.warning("[cleanup] falhou: %s", exc)
+
+    app.job_queue.run_repeating(
+        _cleanup_job,
+        interval=24 * 60 * 60,  # 1x por dia
+        first=15 * 60,           # 15 min apos start
+        name="cleanup_notifications",
     )
 
     log.info(

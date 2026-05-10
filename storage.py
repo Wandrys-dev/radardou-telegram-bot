@@ -34,6 +34,25 @@ class UserStorage:
             if "last_alert_check" not in cols:
                 conn.execute("ALTER TABLE users ADD COLUMN last_alert_check TEXT")
 
+            # Dedup de alertas: cada (chat_id, alert_id, publicacao_id) so eh
+            # notificada uma unica vez. Mesmo padrao da AlertNotification da
+            # app web (Prisma), pra consistencia entre canais email e Telegram.
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS alert_notifications (
+                    chat_id INTEGER NOT NULL,
+                    alert_id INTEGER NOT NULL,
+                    publicacao_id TEXT NOT NULL,
+                    notified_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (chat_id, alert_id, publicacao_id)
+                )
+                """
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_alert_notif_notified_at "
+                "ON alert_notifications(notified_at)"
+            )
+
     # ---------- chave ----------
 
     def set_api_key(self, chat_id: int, api_key: str):
@@ -96,3 +115,47 @@ class UserStorage:
             )
             row = cur.fetchone()
             return bool(row[0]) if row else False
+
+    # ---------- dedup de notificacoes de alerta ----------
+
+    def filter_unnotified_pubs(
+        self, chat_id: int, alert_id: int, pub_ids: list[str]
+    ) -> set[str]:
+        """Retorna o subset de pub_ids que ainda NAO foi notificado pra esse
+        chat_id+alert_id. Usado em batch pra evitar N queries."""
+        if not pub_ids:
+            return set()
+        ids_str = [str(p) for p in pub_ids]
+        placeholders = ",".join("?" * len(ids_str))
+        with sqlite3.connect(self.db_path) as conn:
+            cur = conn.execute(
+                f"SELECT publicacao_id FROM alert_notifications "
+                f"WHERE chat_id = ? AND alert_id = ? "
+                f"AND publicacao_id IN ({placeholders})",
+                (chat_id, alert_id, *ids_str),
+            )
+            already = {row[0] for row in cur.fetchall()}
+        return {pid for pid in ids_str if pid not in already}
+
+    def mark_notified(self, chat_id: int, alert_id: int, pub_ids: list[str]):
+        """Registra que essas pubs foram notificadas pra esse alerta. INSERT
+        OR IGNORE protege contra race condition se o cron rodar paralelo."""
+        if not pub_ids:
+            return
+        rows = [(chat_id, alert_id, str(p)) for p in pub_ids]
+        with sqlite3.connect(self.db_path) as conn:
+            conn.executemany(
+                "INSERT OR IGNORE INTO alert_notifications "
+                "(chat_id, alert_id, publicacao_id) VALUES (?, ?, ?)",
+                rows,
+            )
+
+    def cleanup_old_notifications(self, days: int = 90) -> int:
+        """Remove registros de dedup com mais de N dias. Retorna quantos."""
+        with sqlite3.connect(self.db_path) as conn:
+            cur = conn.execute(
+                "DELETE FROM alert_notifications "
+                "WHERE notified_at < datetime('now', ?)",
+                (f"-{days} days",),
+            )
+            return cur.rowcount
