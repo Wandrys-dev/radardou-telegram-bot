@@ -22,6 +22,7 @@ from telegram.ext import (
     CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
+    ConversationHandler,
     MessageHandler,
     filters,
 )
@@ -248,6 +249,7 @@ async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ],
         [
             InlineKeyboardButton("📆 Últimos 30 dias", callback_data="menu:30d"),
+            InlineKeyboardButton("🎛️ Filtros avançados", callback_data="menu:filtros"),
         ],
         [
             InlineKeyboardButton("🔔 Meus alertas", callback_data="menu:alertas"),
@@ -604,8 +606,9 @@ async def cmd_ajuda(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/revogar — remove sua chave deste bot\n\n"
         "<b>Consulta:</b>\n"
         "/menu — abre menu rápido com botões\n"
+        "/filtros — busca guiada por etapas (período + termo + seção)\n"
         "/hoje — publicações de hoje\n"
-        "/buscar &lt;termo&gt; [filtros] — busca avançada\n"
+        "/buscar &lt;termo&gt; [filtros] — busca via texto\n"
         "/alertas — lista seus alertas configurados\n"
         "/favoritos — lista suas publicações favoritas\n\n"
         "<b>Filtros (formato chave:valor):</b>\n"
@@ -624,6 +627,235 @@ async def cmd_ajuda(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Site: https://www.radar-dou.com"
     )
     await update.effective_message.reply_html(txt, disable_web_page_preview=True)
+
+
+# ---------------------------------------------------------------------------
+# Wizard de filtros (/filtros)
+# ---------------------------------------------------------------------------
+
+WIZ_PERIODO, WIZ_PERIODO_CUSTOM, WIZ_TERMO, WIZ_SECAO = range(4)
+
+DATE_RANGE_RE = re.compile(
+    r"^\s*(\d{2})/(\d{2})/(\d{4})\s*-\s*(\d{2})/(\d{2})/(\d{4})\s*$"
+)
+
+
+def _wiz_kb_periodo() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("📅 Hoje", callback_data="wiz:periodo:hoje"),
+            InlineKeyboardButton("🗓 Últimos 7 dias", callback_data="wiz:periodo:7d"),
+        ],
+        [
+            InlineKeyboardButton("📆 Últimos 30 dias", callback_data="wiz:periodo:30d"),
+            InlineKeyboardButton("✏️ Personalizado", callback_data="wiz:periodo:custom"),
+        ],
+        [InlineKeyboardButton("❌ Cancelar", callback_data="wiz:cancel")],
+    ])
+
+
+def _wiz_kb_termo() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("⏭️ Pular (sem termo)", callback_data="wiz:termo:skip")],
+        [InlineKeyboardButton("❌ Cancelar", callback_data="wiz:cancel")],
+    ])
+
+
+def _wiz_kb_secao() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("DO1", callback_data="wiz:secao:DO1"),
+            InlineKeyboardButton("DO2", callback_data="wiz:secao:DO2"),
+            InlineKeyboardButton("DO3", callback_data="wiz:secao:DO3"),
+        ],
+        [
+            InlineKeyboardButton("Edição Extra", callback_data="wiz:secao:Extra"),
+            InlineKeyboardButton("✅ Todas", callback_data="wiz:secao:all"),
+        ],
+        [InlineKeyboardButton("❌ Cancelar", callback_data="wiz:cancel")],
+    ])
+
+
+async def cmd_filtros(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Entry point do wizard guiado. Pergunta período primeiro."""
+    chat_id = update.effective_chat.id
+    if not get_client(chat_id):
+        await update.effective_message.reply_text(
+            "Cadastre sua chave primeiro: /chave rdk_prod_xxx"
+        )
+        return ConversationHandler.END
+
+    context.user_data["wiz_filtros"] = {}
+
+    await update.effective_message.reply_html(
+        "🔍 <b>Busca avançada — passo 1/3</b>\n\n"
+        "Escolha o <b>período</b> que deseja consultar:",
+        reply_markup=_wiz_kb_periodo(),
+    )
+    return WIZ_PERIODO
+
+
+async def wiz_on_periodo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    parts = query.data.split(":")
+    if len(parts) < 3:
+        return WIZ_PERIODO
+    choice = parts[2]
+    today = date.today()
+    f = context.user_data.setdefault("wiz_filtros", {})
+
+    if choice == "hoje":
+        f["date_from"] = today.isoformat()
+        f["date_to"] = today.isoformat()
+    elif choice == "7d":
+        f["date_from"] = (today - timedelta(days=7)).isoformat()
+    elif choice == "30d":
+        f["date_from"] = (today - timedelta(days=30)).isoformat()
+    elif choice == "custom":
+        await query.edit_message_text(
+            "📅 <b>Período personalizado</b>\n\n"
+            "Digite no formato <code>DD/MM/AAAA-DD/MM/AAAA</code>\n\n"
+            "Exemplos:\n"
+            "<code>01/05/2026-09/05/2026</code>\n"
+            "<code>15/04/2026-10/05/2026</code>",
+            parse_mode="HTML",
+        )
+        return WIZ_PERIODO_CUSTOM
+
+    return await _wiz_ask_termo(query.message, context, edit=True)
+
+
+async def wiz_on_periodo_custom(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (update.message.text or "").strip()
+    m = DATE_RANGE_RE.match(text)
+    if not m:
+        await update.message.reply_html(
+            "Formato inválido. Use <code>DD/MM/AAAA-DD/MM/AAAA</code>\n"
+            "Exemplo: <code>01/05/2026-09/05/2026</code>\n\n"
+            "Tente de novo ou /cancelar:"
+        )
+        return WIZ_PERIODO_CUSTOM
+
+    df = f"{m.group(3)}-{m.group(2)}-{m.group(1)}"
+    dt = f"{m.group(6)}-{m.group(5)}-{m.group(4)}"
+    f = context.user_data.setdefault("wiz_filtros", {})
+    f["date_from"] = df
+    f["date_to"] = dt
+
+    return await _wiz_ask_termo(update.message, context, edit=False)
+
+
+async def _wiz_ask_termo(message, context: ContextTypes.DEFAULT_TYPE, edit: bool):
+    f = context.user_data.get("wiz_filtros", {})
+    df_br = _iso_to_br(f.get("date_from", ""))
+    dt_br = _iso_to_br(f.get("date_to", ""))
+    if df_br and dt_br:
+        per = f"{df_br} até {dt_br}"
+    elif df_br:
+        per = f"desde {df_br}"
+    else:
+        per = "—"
+
+    txt = (
+        "🔍 <b>Busca avançada — passo 2/3</b>\n\n"
+        f"✅ Período: <i>{per}</i>\n\n"
+        "Digite agora um <b>termo</b> ou <b>órgão</b>:\n\n"
+        "Exemplos:\n"
+        "• <code>concurso público</code>\n"
+        "• <code>orgao:Banco Central</code>\n"
+        "• <code>tipo:Portaria orgao:Tribunal de Contas</code>\n\n"
+        "Ou clique em <i>Pular</i> pra buscar sem filtro de texto."
+    )
+    if edit:
+        await message.edit_text(txt, parse_mode="HTML", reply_markup=_wiz_kb_termo())
+    else:
+        await message.reply_html(txt, reply_markup=_wiz_kb_termo())
+    return WIZ_TERMO
+
+
+async def wiz_on_termo_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (update.message.text or "").strip()
+    parsed = parse_filters(text)
+    f = context.user_data.setdefault("wiz_filtros", {})
+    # Não sobrescreve date_from/date_to já configurados
+    for k, v in parsed.items():
+        if k in ("date_from", "date_to") and k in f:
+            continue
+        f[k] = v
+
+    return await _wiz_ask_secao(update.message, context, edit=False)
+
+
+async def wiz_on_termo_skip(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    return await _wiz_ask_secao(query.message, context, edit=True)
+
+
+async def _wiz_ask_secao(message, context: ContextTypes.DEFAULT_TYPE, edit: bool):
+    f = context.user_data.get("wiz_filtros", {})
+    resumo = []
+    if f.get("query"):
+        resumo.append(f"termo: <i>{escape(f['query'])}</i>")
+    if f.get("orgao"):
+        resumo.append(f"órgão: <i>{escape(f['orgao'])}</i>")
+    if f.get("tipo"):
+        resumo.append(f"tipo: <i>{escape(f['tipo'])}</i>")
+
+    txt = (
+        "🔍 <b>Busca avançada — passo 3/3</b>\n\n"
+        + (("Filtros: " + " · ".join(resumo) + "\n\n") if resumo else "")
+        + "Escolha a <b>seção</b> do DOU:"
+    )
+
+    if edit:
+        await message.edit_text(txt, parse_mode="HTML", reply_markup=_wiz_kb_secao())
+    else:
+        await message.reply_html(txt, reply_markup=_wiz_kb_secao())
+    return WIZ_SECAO
+
+
+async def wiz_on_secao(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    parts = query.data.split(":")
+    if len(parts) < 3:
+        return WIZ_SECAO
+    choice = parts[2]
+    f = context.user_data.setdefault("wiz_filtros", {})
+    if choice != "all":
+        f["secao"] = choice
+
+    # Mostra resumo final + executa busca
+    chat_id = query.message.chat.id
+    await query.edit_message_text("🔍 Buscando…", parse_mode="HTML")
+
+    # Reaproveita _do_search com filtros coletados
+    fake = Update(update.update_id, message=query.message)
+    await _do_search(fake, context, chat_id, f, page=0)
+
+    context.user_data.pop("wiz_filtros", None)
+    return ConversationHandler.END
+
+
+async def wiz_cancel_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text("❌ Busca cancelada.")
+    context.user_data.pop("wiz_filtros", None)
+    return ConversationHandler.END
+
+
+async def wiz_cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.effective_message.reply_text("❌ Busca cancelada.")
+    context.user_data.pop("wiz_filtros", None)
+    return ConversationHandler.END
+
+
+# ---------------------------------------------------------------------------
+# Erro handler
+# ---------------------------------------------------------------------------
 
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
@@ -755,6 +987,38 @@ def main():
     app.add_handler(CommandHandler("favoritos", cmd_favoritos))
     app.add_handler(CommandHandler("ajuda", cmd_ajuda))
     app.add_handler(CommandHandler("help", cmd_ajuda))
+
+    # Wizard /filtros (ConversationHandler) — registrado ANTES dos handlers
+    # genéricos pra que ele consuma o input em estados ativos
+    filtros_conv = ConversationHandler(
+        entry_points=[
+            CommandHandler("filtros", cmd_filtros),
+            CommandHandler("buscar_avancada", cmd_filtros),
+            CallbackQueryHandler(cmd_filtros, pattern=r"^menu:filtros$"),
+        ],
+        states={
+            WIZ_PERIODO: [
+                CallbackQueryHandler(wiz_on_periodo, pattern=r"^wiz:periodo:"),
+            ],
+            WIZ_PERIODO_CUSTOM: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, wiz_on_periodo_custom),
+            ],
+            WIZ_TERMO: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, wiz_on_termo_text),
+                CallbackQueryHandler(wiz_on_termo_skip, pattern=r"^wiz:termo:skip$"),
+            ],
+            WIZ_SECAO: [
+                CallbackQueryHandler(wiz_on_secao, pattern=r"^wiz:secao:"),
+            ],
+        },
+        fallbacks=[
+            CommandHandler("cancelar", wiz_cancel_command),
+            CallbackQueryHandler(wiz_cancel_button, pattern=r"^wiz:cancel$"),
+        ],
+        per_chat=True,
+        per_user=True,
+    )
+    app.add_handler(filtros_conv)
 
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_plain_text))
