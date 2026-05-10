@@ -853,6 +853,21 @@ AI_TOOLS = [
                             "'legislacao' pra leis/decretos/MPs."
                         ),
                     },
+                    "fase": {
+                        "type": "string",
+                        "enum": ["abertura", "resultado", "homologacao", "retificacao", "prorrogacao"],
+                        "description": (
+                            "Fase do edital (heuristica por padroes no titulo, nao eh "
+                            "classificacao por LLM). Use principalmente junto com "
+                            "categoria='concursos':\n"
+                            "- 'abertura': editais novos (nao tem 'resultado'/'homologa'/"
+                            "'retifica'/'prorroga' no titulo)\n"
+                            "- 'resultado': titulo com 'resultado' (e sem 'homologa')\n"
+                            "- 'homologacao': titulo com 'homologa'\n"
+                            "- 'retificacao': titulo com 'retifica'\n"
+                            "- 'prorrogacao': titulo com 'prorroga'"
+                        ),
+                    },
                     "limit": {"type": "integer", "default": 5, "minimum": 1, "maximum": 20},
                 },
             },
