@@ -679,6 +679,8 @@ Suas capacidades:
 - Listar e criar alertas que rodam automaticamente
 - Listar favoritos do usuario
 
+{date_hints}
+
 REGRAS GERAIS:
 1. NUNCA invente dados — sempre use as ferramentas pra buscar informacoes reais.
 2. Respostas em PT-BR, curtas e diretas. No maximo 4-5 linhas no texto principal.
@@ -686,18 +688,12 @@ REGRAS GERAIS:
 4. Se a pergunta for vaga, peca pra esclarecer ANTES de buscar.
 5. Se o usuario pedir algo fora do escopo do DOU, redirecione gentilmente.
 
-INTERPRETACAO DE EXPRESSOES DE TEMPO (convencao brasileira: semana comeca no DOMINGO):
-- "hoje" → date_from = date_to = HOJE
-- "ontem" → date_from = date_to = HOJE - 1 dia
-- "esta semana" / "nesta semana" → date_from = ULTIMO DOMINGO (inclusive); date_to = HOJE
-  IMPORTANTE: se HOJE for domingo, date_from = HOJE (a semana esta comecando)
-- "semana passada" → date_from = domingo de 7 dias atras; date_to = sabado anterior a HOJE
-- "ultimos 7 dias" → date_from = HOJE - 7; date_to = HOJE
-- "este mes" → date_from = dia 1 do mes atual; date_to = HOJE
-- "ultimos 30 dias" → date_from = HOJE - 30
-- "no dia DD/MM/AAAA" → date_from = date_to = essa data
-- "entre X e Y" → date_from = X, date_to = Y
-- Se o usuario NAO especificou periodo, use date_from = HOJE - 7 dias.
+DATAS - REGRA INVIOLAVEL:
+Quando o usuario mencionar uma expressao temporal (esta semana, semana
+passada, ultimos N dias, este mes etc), use EXATAMENTE os valores
+date_from e date_to da TABELA acima. NAO calcule, NAO ajuste, NAO
+substitua por aproximacoes. Se o usuario nao especificar periodo,
+deixe date_from e date_to vazios — NAO assuma 'ultimos 7 dias'.
 
 ESTRATEGIA DE BUSCA (CRITICO):
 - Para CATEGORIAS especiais, use o param 'categoria' (NAO use query):
@@ -712,8 +708,8 @@ ESTRATEGIA DE BUSCA (CRITICO):
   - "portarias do MEC" → orgao="Ministerio da Educacao", tipo="Portaria" (sem query)
 
 - Use 'orgao' pra match parcial no nome do orgao (ex: "Banco Central").
-- Se a primeira busca trouxer 0 resultados, AMPLIE: aumente periodo OU troque
-  categoria por query (ou vice-versa), OU use sinonimos.
+- Se a busca trouxer 0 resultados, REPORTE 0 honestamente — NAO ample sozinho.
+  Apenas SUGIRA ao usuario que ele aumente o periodo ou tente outra categoria.
 
 FORMATACAO DA RESPOSTA AO USUARIO (CRITICO):
 - NUNCA mostre IDs numericos das publicacoes no texto da resposta. Eles sao usados internamente.
@@ -721,13 +717,52 @@ FORMATACAO DA RESPOSTA AO USUARIO (CRITICO):
   automaticamente depois da sua resposta.
 - A sua resposta deve ser apenas um RESUMO ANALITICO em 2-3 linhas:
   "Encontrei N publicacoes sobre X. A maioria eh do orgao Y, dos dias Z."
-- Termine sempre com uma SUGESTAO de proxima acao: "Quer criar um alerta?",
-  "Quer que eu detalhe alguma especifica?", "Quer filtrar por DO3?"
+- Se total = 0, diga claramente: "Nao encontrei nenhuma publicacao no periodo X.
+  Quer ampliar pra ultimos 7 dias / semana passada / mes inteiro?"
+- Termine sempre com uma SUGESTAO de proxima acao.
 
-CONTEXTO ATUAL:
-- Data de hoje: {today}
+LEMBRETE:
 - O usuario esta no Telegram com tela pequena. Seja conciso ao maximo.
+- O DOU nao publica aos domingos e raramente em feriados — se a busca der zero
+  num periodo curto, considere se isso eh esperado pelo dia da semana.
 """
+
+
+def _build_date_hints() -> str:
+    """Pre-calcula tabela de datas em PT-BR pra injetar no system prompt.
+
+    Convencao brasileira: semana comeca no domingo. Brasil nao tem DST desde
+    2019, entao usa offset fixo UTC-3.
+    """
+    br_tz = timezone(timedelta(hours=-3))
+    today = datetime.now(br_tz).date()
+    weekdays_pt = ["segunda-feira", "terca-feira", "quarta-feira",
+                   "quinta-feira", "sexta-feira", "sabado", "domingo"]
+    today_dow = weekdays_pt[today.weekday()]
+
+    days_since_sunday = (today.weekday() + 1) % 7  # py wd: Mon=0..Sun=6
+    last_sunday = today - timedelta(days=days_since_sunday)
+    saturday_prev = last_sunday - timedelta(days=1)
+    sunday_prev = last_sunday - timedelta(days=7)
+    yesterday = today - timedelta(days=1)
+    seven_days_ago = today - timedelta(days=7)
+    thirty_days_ago = today - timedelta(days=30)
+    first_of_month = today.replace(day=1)
+
+    rows = [
+        ("hoje", today, today),
+        ("ontem", yesterday, yesterday),
+        ("esta semana / nesta semana", last_sunday, today),
+        ("semana passada", sunday_prev, saturday_prev),
+        ("ultimos 7 dias / ultima semana corrida", seven_days_ago, today),
+        ("ultimos 30 dias / ultimo mes corrido", thirty_days_ago, today),
+        ("este mes / mes atual", first_of_month, today),
+    ]
+
+    lines = [f"DATA DE HOJE: {today.isoformat()} ({today_dow})", "", "TABELA DE PERIODOS PRE-CALCULADOS (use exatamente estes valores):"]
+    for label, df, dt in rows:
+        lines.append(f"- '{label}': date_from={df.isoformat()}, date_to={dt.isoformat()}")
+    return "\n".join(lines)
 
 AI_TOOLS = [
     {
@@ -945,8 +980,8 @@ async def ask_ai(
     if not radar:
         return ("Cadastre sua chave do Radar DOU primeiro: /chave rdk_prod_xxx", [])
 
-    today_str = date.today().strftime("%Y-%m-%d (%A)")
-    system = AI_SYSTEM_PROMPT.format(today=today_str)
+    date_hints = _build_date_hints()
+    system = AI_SYSTEM_PROMPT.format(date_hints=date_hints)
 
     messages: list[dict[str, Any]] = [{"role": "system", "content": system}]
     if history:
