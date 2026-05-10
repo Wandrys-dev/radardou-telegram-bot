@@ -679,18 +679,44 @@ Suas capacidades:
 - Listar e criar alertas que rodam automaticamente
 - Listar favoritos do usuario
 
-REGRAS:
+REGRAS GERAIS:
 1. NUNCA invente dados — sempre use as ferramentas pra buscar informacoes reais.
-2. Seja direto e curto. Respostas em PT-BR, no maximo 5-6 linhas.
-3. Use formatacao Markdown leve do Telegram: *negrito*, _italico_, `codigo`.
-4. Quando mostrar publicacoes, formate cada uma em 1 ou 2 linhas: data, titulo curto e id.
-5. Apos buscar, ofereca acoes uteis: criar alerta, ver detalhes (com /ia mostre o ato 12345), favoritar.
-6. Se a pergunta for vaga, peca pra esclarecer ANTES de buscar (evita scan amplo).
-7. Se o usuario pedir algo fora do escopo do DOU, redirecione gentilmente.
+2. Respostas em PT-BR, curtas e diretas. No maximo 4-5 linhas no texto principal.
+3. Use formatacao Markdown leve: *negrito*, _italico_, `codigo` (sem HTML).
+4. Se a pergunta for vaga, peca pra esclarecer ANTES de buscar.
+5. Se o usuario pedir algo fora do escopo do DOU, redirecione gentilmente.
+
+INTERPRETACAO DE EXPRESSOES DE TEMPO (use date_from/date_to):
+- "hoje" → date_from e date_to = data de HOJE (mesmo valor)
+- "ontem" → date_from e date_to = ontem
+- "esta semana" / "nesta semana" / "this week" → date_from = primeira segunda-feira da semana atual ATE hoje
+- "ultimos 7 dias" / "ultima semana" → date_from = HOJE - 7 dias
+- "este mes" / "neste mes" → date_from = primeiro dia do mes atual ATE hoje
+- "ultimos 30 dias" / "ultimo mes" → date_from = HOJE - 30 dias
+- "no dia DD/MM" → date_from = date_to = essa data
+- "entre X e Y" → date_from = X, date_to = Y
+- Se o usuario nao especificou periodo, use date_from = HOJE - 7 dias.
+
+ESTRATEGIA DE QUERY:
+- Use termos CURTOS e GENERICOS pra maximizar matches:
+  - "concurso publico" / "concursos" → query="concurso"
+  - "licitacoes" → query="licitacao"
+  - "editais" → query="edital"
+  - "portarias do MEC" → query=None, orgao="Ministerio da Educacao", tipo="Portaria"
+- Se a primeira busca trouxer 0 resultados, AMPLIE (query mais curta OU periodo maior).
+
+FORMATACAO DA RESPOSTA AO USUARIO (CRITICO):
+- NUNCA mostre IDs numericos das publicacoes no texto da resposta. Eles sao usados internamente.
+- NUNCA liste publicacoes em texto longo no chat — o bot ja vai renderizar cards bonitos
+  automaticamente depois da sua resposta.
+- A sua resposta deve ser apenas um RESUMO ANALITICO em 2-3 linhas:
+  "Encontrei N publicacoes sobre X. A maioria eh do orgao Y, dos dias Z."
+- Termine sempre com uma SUGESTAO de proxima acao: "Quer criar um alerta?",
+  "Quer que eu detalhe alguma especifica?", "Quer filtrar por DO3?"
 
 CONTEXTO ATUAL:
 - Data de hoje: {today}
-- O usuario esta no Telegram, entao mantenha respostas concisas.
+- O usuario esta no Telegram com tela pequena. Seja conciso ao maximo.
 """
 
 AI_TOOLS = [
@@ -774,29 +800,53 @@ AI_TOOLS = [
 ]
 
 
-async def _exec_tool(name: str, args: dict, radar: RadarDOU) -> str:
-    """Executa uma ferramenta solicitada pela IA. Retorna string textual com o resultado."""
+async def _exec_tool(
+    name: str,
+    args: dict,
+    radar: RadarDOU,
+    pubs_to_render: list,
+) -> str:
+    """Executa uma ferramenta solicitada pela IA. Retorna string textual com o resultado.
+
+    pubs_to_render: lista mutavel onde acumulamos publicacoes que o bot vai
+    renderizar como cards bonitos depois da resposta da IA.
+    """
     try:
         if name == "buscar_publicacoes":
-            limit = min(int(args.pop("limit", 5)), 20)
+            limit = min(int(args.pop("limit", 5)), 10)
             kwargs = {k: v for k, v in args.items() if v}
             if not kwargs:
-                return "Erro: pelo menos um filtro eh obrigatorio."
+                return "Erro: pelo menos um filtro eh obrigatorio (query, date_from, etc)."
             kwargs["limit"] = limit
             res = radar.buscar(**kwargs)
             total = res["pagination"]["total"]
             items = res["data"]
             if not items:
-                return f"Nenhuma publicacao encontrada. Filtros: {kwargs}."
-            lines = [f"Total no banco: {total} (mostrando {len(items)})"]
-            for p in items:
-                d = (p.get("data_publicacao") or "")[:10]
-                titulo = (p.get("titulo") or "(sem titulo)")[:90]
-                orgao = (p.get("orgao_hierarquia") or "").split("/")[-1][:60]
-                lines.append(
-                    f"- id={p.get('id')} | [{p.get('secao_codigo','?')}] {d} | "
-                    f"{titulo} | orgao={orgao}"
+                return (
+                    f"Nenhuma publicacao encontrada com {kwargs}. "
+                    "Sugestao: amplie a query (use termos mais curtos) ou aumente o periodo."
                 )
+
+            # Acumula pra renderizacao posterior
+            pubs_to_render.extend(items)
+
+            # Resumo agregado pra IA processar (sem IDs ou detalhes que vao nos cards)
+            datas = sorted({(p.get("data_publicacao") or "")[:10] for p in items if p.get("data_publicacao")})
+            secoes = sorted({p.get("secao_codigo") or "?" for p in items})
+            tipos = sorted({p.get("tipo_ato") or "?" for p in items})
+            orgaos_set = {((p.get("orgao_hierarquia") or "").split("/")[-1] or "?") for p in items}
+            orgaos_top = sorted(orgaos_set)[:5]
+
+            lines = [
+                f"BUSCA OK. Total no banco: {total}. Cards mostrados: {len(items)}.",
+                f"Datas: {', '.join(datas) or '-'}",
+                f"Secoes: {', '.join(secoes)}",
+                f"Tipos: {', '.join(tipos)}",
+                f"Orgaos (amostra): {', '.join(orgaos_top)}",
+                "",
+                "OBS: o bot ja vai mostrar os cards detalhados ao usuario. Voce so precisa "
+                "fazer um RESUMO curto (2-3 linhas) e oferecer uma proxima acao.",
+            ]
             return "\n".join(lines)
 
         if name == "obter_publicacao_completa":
@@ -849,36 +899,47 @@ async def _exec_tool(name: str, args: dict, radar: RadarDOU) -> str:
         return f"Erro ao executar {name}: {exc}"
 
 
-async def ask_ai(chat_id: int, user_message: str, history: list[dict] | None = None) -> str:
-    """Manda pergunta pra OpenAI com tools disponiveis. Retorna texto final."""
+async def ask_ai(
+    chat_id: int,
+    user_message: str,
+    history: list[dict] | None = None,
+) -> tuple[str, list[dict]]:
+    """Manda pergunta pra OpenAI com tools disponiveis.
+
+    Retorna (texto_resposta, lista_de_publicacoes_pra_renderizar).
+    O bot vai enviar o texto + cards bonitos das publicacoes em sequencia.
+    """
     if not ai_client:
         return (
             "🤖 IA nao configurada.\n\n"
             "O operador do bot precisa adicionar OPENAI_API_KEY como variavel de "
-            "ambiente. Por enquanto, use os comandos manuais: /menu, /filtros, /buscar."
+            "ambiente. Por enquanto, use os comandos manuais: /menu, /filtros, /buscar.",
+            [],
         )
 
     radar = get_client(chat_id)
     if not radar:
-        return "Cadastre sua chave do Radar DOU primeiro: /chave rdk_prod_xxx"
+        return ("Cadastre sua chave do Radar DOU primeiro: /chave rdk_prod_xxx", [])
 
     today_str = date.today().strftime("%Y-%m-%d (%A)")
     system = AI_SYSTEM_PROMPT.format(today=today_str)
 
     messages: list[dict[str, Any]] = [{"role": "system", "content": system}]
     if history:
-        messages.extend(history[-12:])  # contexto recente
+        messages.extend(history[-12:])
     messages.append({"role": "user", "content": user_message})
 
+    pubs_to_render: list[dict] = []
+
     try:
-        for _ in range(5):  # max 5 rodadas de tool calls
+        for _ in range(5):
             resp = await ai_client.chat.completions.create(
                 model=OPENAI_MODEL,
                 messages=messages,
                 tools=AI_TOOLS,
                 tool_choice="auto",
                 temperature=0.3,
-                max_tokens=900,
+                max_tokens=600,
             )
             choice = resp.choices[0].message
             tool_calls = choice.tool_calls or []
@@ -904,7 +965,7 @@ async def ask_ai(chat_id: int, user_message: str, history: list[dict] | None = N
             )
 
             if not tool_calls:
-                return choice.content or "(sem resposta da IA)"
+                return (choice.content or "(sem resposta da IA)", pubs_to_render)
 
             for tc in tool_calls:
                 args_json = tc.function.arguments or "{}"
@@ -912,20 +973,42 @@ async def ask_ai(chat_id: int, user_message: str, history: list[dict] | None = N
                     args = json.loads(args_json)
                 except json.JSONDecodeError:
                     args = {}
-                result = await _exec_tool(tc.function.name, args, radar)
+                result = await _exec_tool(tc.function.name, args, radar, pubs_to_render)
                 messages.append(
                     {"role": "tool", "tool_call_id": tc.id, "content": result}
                 )
 
-        return "Nao consegui chegar a uma resposta apos 5 iteracoes. Tente reformular a pergunta."
+        return (
+            "Nao consegui chegar a uma resposta apos 5 iteracoes. Tente reformular.",
+            pubs_to_render,
+        )
     except Exception as exc:
         log.exception("erro chamando OpenAI")
-        return f"Erro na IA: {exc}"
+        return (f"Erro na IA: {exc}", pubs_to_render)
     finally:
         try:
             radar.close()
         except Exception:
             pass
+
+
+async def _send_ai_response(update: Update, response_text: str, pubs: list[dict]):
+    """Envia o texto da IA e depois os cards das publicacoes (se houver)."""
+    if response_text:
+        try:
+            await update.effective_message.reply_text(response_text, parse_mode="Markdown")
+        except Exception:
+            await update.effective_message.reply_text(response_text)
+
+    # Renderiza cards bonitos das publicacoes que a IA buscou
+    for pub in pubs[:10]:
+        try:
+            await update.effective_message.reply_html(
+                html_card(pub),
+                disable_web_page_preview=True,
+            )
+        except Exception as exc:
+            log.warning("erro ao renderizar card da publicacao: %s", exc)
 
 
 async def cmd_ia(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -945,11 +1028,8 @@ async def cmd_ia(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pergunta = " ".join(context.args)
     chat_id = update.effective_chat.id
     await update.message.chat.send_action(ChatAction.TYPING)
-    response = await ask_ai(chat_id, pergunta)
-    try:
-        await update.message.reply_text(response, parse_mode="Markdown")
-    except Exception:
-        await update.message.reply_text(response)
+    response_text, pubs = await ask_ai(chat_id, pergunta)
+    await _send_ai_response(update, response_text, pubs)
 
 
 # Conversacao continua via ConversationHandler
@@ -987,16 +1067,13 @@ async def conv_on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     history = context.user_data.get("ai_history", [])
     await update.message.chat.send_action(ChatAction.TYPING)
-    response = await ask_ai(chat_id, text, history)
+    response_text, pubs = await ask_ai(chat_id, text, history)
 
     history.append({"role": "user", "content": text})
-    history.append({"role": "assistant", "content": response})
-    context.user_data["ai_history"] = history[-24:]  # max 24 msgs
+    history.append({"role": "assistant", "content": response_text})
+    context.user_data["ai_history"] = history[-24:]
 
-    try:
-        await update.message.reply_text(response, parse_mode="Markdown")
-    except Exception:
-        await update.message.reply_text(response)
+    await _send_ai_response(update, response_text, pubs)
     return CONV_AI
 
 
