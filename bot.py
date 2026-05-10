@@ -9,14 +9,17 @@ Recursos:
   alertas configurados de cada usuario na conta dele e notifica novos hits
 """
 
+import json
 import logging
 import os
 import re
 from datetime import date, datetime, timedelta, timezone
 from html import escape
+from typing import Any
 
 from dotenv import load_dotenv
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.constants import ChatAction
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -26,6 +29,11 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
+
+try:
+    from openai import AsyncOpenAI
+except Exception:  # openai opcional — bot continua funcionando sem IA
+    AsyncOpenAI = None  # type: ignore
 
 from radardou import RadarDOU
 from storage import UserStorage
@@ -38,6 +46,8 @@ load_dotenv()
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 DB_PATH = os.getenv("DATABASE_PATH", "bot_users.db")
 CHECK_ALERTS_INTERVAL_MIN = int(os.getenv("CHECK_ALERTS_INTERVAL_MIN", "30"))
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
 if not TOKEN:
     raise SystemExit(
@@ -57,6 +67,14 @@ PAGE_SIZE = 5
 DEFAULT_LIMIT = 20
 
 SEARCH_STATE: dict[int, dict] = {}  # paginacao por chat_id
+
+# Cliente OpenAI (opcional — se nao tiver chave, comandos /ia e /conversar
+# devolvem mensagem amigavel pedindo pra configurar)
+ai_client = (
+    AsyncOpenAI(api_key=OPENAI_API_KEY)
+    if (AsyncOpenAI and OPENAI_API_KEY)
+    else None
+)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -250,6 +268,9 @@ async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [
             InlineKeyboardButton("📆 Últimos 30 dias", callback_data="menu:30d"),
             InlineKeyboardButton("🎛️ Filtros avançados", callback_data="menu:filtros"),
+        ],
+        [
+            InlineKeyboardButton("🤖 Falar com a IA", callback_data="menu:ia"),
         ],
         [
             InlineKeyboardButton("🔔 Meus alertas", callback_data="menu:alertas"),
@@ -503,6 +524,19 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await cmd_ajuda(fake, context)
         return
 
+    if data == "menu:ia":
+        await query.message.reply_html(
+            "🤖 <b>Assistente Virtual com IA</b>\n\n"
+            "Duas formas de usar:\n\n"
+            "1️⃣ Pergunta única — manda /ia seguido da sua pergunta:\n"
+            "<code>/ia me mostra publicacoes de hoje sobre concursos</code>\n\n"
+            "2️⃣ Conversa contínua — manda /conversar e tudo que digitar vai pra IA "
+            "(com memória do contexto). Sai com /sair quando quiser.\n\n"
+            "A IA pode buscar publicações, criar alertas, listar favoritos e mais — "
+            "usando a sua chave do Radar DOU."
+        )
+        return
+
 
 async def cmd_alertas(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -611,6 +645,10 @@ async def cmd_ajuda(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/buscar &lt;termo&gt; [filtros] — busca via texto\n"
         "/alertas — lista seus alertas configurados\n"
         "/favoritos — lista suas publicações favoritas\n\n"
+        "<b>Assistente Virtual com IA:</b>\n"
+        "/ia &lt;pergunta&gt; — pergunta única à IA (responde direto)\n"
+        "/conversar — modo conversação contínua (com memória)\n"
+        "/sair — sai do modo conversação\n\n"
         "<b>Filtros (formato chave:valor):</b>\n"
         "<code>orgao:Banco Central</code> — match parcial no nome do órgão\n"
         "<code>secao:DO1</code> — DO1, DO2, DO3 ou Extra\n"
@@ -627,6 +665,347 @@ async def cmd_ajuda(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Site: https://www.radar-dou.com"
     )
     await update.effective_message.reply_html(txt, disable_web_page_preview=True)
+
+
+# ---------------------------------------------------------------------------
+# Assistente Virtual com IA (/ia e /conversar)
+# ---------------------------------------------------------------------------
+
+AI_SYSTEM_PROMPT = """Voce eh o Assistente Virtual do Radar DOU, um sistema de monitoramento do Diario Oficial da Uniao do Brasil.
+
+Suas capacidades:
+- Buscar publicacoes do DOU por palavra-chave, data, secao, tipo de ato e orgao
+- Detalhar uma publicacao especifica (texto completo)
+- Listar e criar alertas que rodam automaticamente
+- Listar favoritos do usuario
+
+REGRAS:
+1. NUNCA invente dados — sempre use as ferramentas pra buscar informacoes reais.
+2. Seja direto e curto. Respostas em PT-BR, no maximo 5-6 linhas.
+3. Use formatacao Markdown leve do Telegram: *negrito*, _italico_, `codigo`.
+4. Quando mostrar publicacoes, formate cada uma em 1 ou 2 linhas: data, titulo curto e id.
+5. Apos buscar, ofereca acoes uteis: criar alerta, ver detalhes (com /ia mostre o ato 12345), favoritar.
+6. Se a pergunta for vaga, peca pra esclarecer ANTES de buscar (evita scan amplo).
+7. Se o usuario pedir algo fora do escopo do DOU, redirecione gentilmente.
+
+CONTEXTO ATUAL:
+- Data de hoje: {today}
+- O usuario esta no Telegram, entao mantenha respostas concisas.
+"""
+
+AI_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "buscar_publicacoes",
+            "description": (
+                "Busca publicacoes no Diario Oficial da Uniao. Pelo menos um filtro eh "
+                "obrigatorio entre query, date_from, date_to, secao, tipo, orgao."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Palavra-chave em titulo ou corpo"},
+                    "date_from": {"type": "string", "description": "Data inicial YYYY-MM-DD"},
+                    "date_to": {"type": "string", "description": "Data final YYYY-MM-DD"},
+                    "secao": {"type": "string", "enum": ["DO1", "DO2", "DO3", "Extra"]},
+                    "tipo": {"type": "string", "description": "Tipo do ato (ex: Portaria, Edital, Despacho, Decreto)"},
+                    "orgao": {"type": "string", "description": "Match parcial no nome do orgao (ex: 'Banco Central')"},
+                    "limit": {"type": "integer", "default": 5, "minimum": 1, "maximum": 20},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "obter_publicacao_completa",
+            "description": "Retorna o texto completo de uma publicacao especifica pelo ID numerico.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string", "description": "ID numerico da publicacao"}
+                },
+                "required": ["id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "listar_alertas_usuario",
+            "description": "Lista os alertas configurados pelo usuario.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "criar_alerta",
+            "description": (
+                "Cria um novo alerta automatico. O alerta vai rodar na frequencia escolhida e "
+                "notificar o usuario quando aparecerem publicacoes que batem com os criterios."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Nome curto e descritivo"},
+                    "query": {"type": "string", "description": "Palavra-chave do alerta"},
+                    "secao": {"type": "string", "enum": ["DO1", "DO2", "DO3", "Extra"]},
+                    "tipo": {"type": "string", "description": "Tipo de ato"},
+                    "frequency": {
+                        "type": "string",
+                        "enum": ["realtime", "hourly", "daily", "weekly"],
+                        "default": "daily",
+                    },
+                },
+                "required": ["name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "listar_favoritos_usuario",
+            "description": "Lista as publicacoes favoritadas pelo usuario.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+]
+
+
+async def _exec_tool(name: str, args: dict, radar: RadarDOU) -> str:
+    """Executa uma ferramenta solicitada pela IA. Retorna string textual com o resultado."""
+    try:
+        if name == "buscar_publicacoes":
+            limit = min(int(args.pop("limit", 5)), 20)
+            kwargs = {k: v for k, v in args.items() if v}
+            if not kwargs:
+                return "Erro: pelo menos um filtro eh obrigatorio."
+            kwargs["limit"] = limit
+            res = radar.buscar(**kwargs)
+            total = res["pagination"]["total"]
+            items = res["data"]
+            if not items:
+                return f"Nenhuma publicacao encontrada. Filtros: {kwargs}."
+            lines = [f"Total no banco: {total} (mostrando {len(items)})"]
+            for p in items:
+                d = (p.get("data_publicacao") or "")[:10]
+                titulo = (p.get("titulo") or "(sem titulo)")[:90]
+                orgao = (p.get("orgao_hierarquia") or "").split("/")[-1][:60]
+                lines.append(
+                    f"- id={p.get('id')} | [{p.get('secao_codigo','?')}] {d} | "
+                    f"{titulo} | orgao={orgao}"
+                )
+            return "\n".join(lines)
+
+        if name == "obter_publicacao_completa":
+            pub = radar.obter_publicacao(args["id"])
+            texto = (pub.get("texto_puro") or "")[:2500]
+            return (
+                f"Titulo: {pub.get('titulo')}\n"
+                f"Data: {(pub.get('data_publicacao') or '')[:10]}\n"
+                f"Secao: {pub.get('secao_codigo')}\n"
+                f"Tipo: {pub.get('tipo_ato')}\n"
+                f"Orgao: {pub.get('orgao_hierarquia')}\n"
+                f"Pagina: {pub.get('numero_pagina')}\n"
+                f"Link: {pub.get('link_ato')}\n\n"
+                f"Texto:\n{texto}"
+            )
+
+        if name == "listar_alertas_usuario":
+            res = radar.listar_alertas()
+            items = res.get("data") if isinstance(res, dict) else res
+            if not items:
+                return "Usuario nao tem alertas configurados."
+            lines = [f"{len(items)} alertas:"]
+            for a in items[:20]:
+                ativo = "ON" if a.get("active", True) else "OFF"
+                lines.append(f"- [{ativo}] {a.get('name','?')} ({a.get('frequency','?')})")
+            return "\n".join(lines)
+
+        if name == "criar_alerta":
+            crit = {k: args[k] for k in ("query", "secao", "tipo") if args.get(k)}
+            if not crit:
+                return "Erro: criterios vazios. Defina ao menos query/secao/tipo."
+            radar.criar_alerta(
+                name=args["name"],
+                search_criteria=crit,
+                frequency=args.get("frequency", "daily"),
+            )
+            return f"Alerta '{args['name']}' criado com sucesso. Frequencia: {args.get('frequency','daily')}."
+
+        if name == "listar_favoritos_usuario":
+            res = radar.listar_favoritos()
+            items = res.get("data") if isinstance(res, dict) else res
+            if not items:
+                return "Sem favoritos salvos."
+            return f"{len(items)} favoritos. (Lista detalhada disponivel via /favoritos no bot.)"
+
+        return f"Ferramenta desconhecida: {name}"
+
+    except Exception as exc:
+        log.exception("erro em tool %s", name)
+        return f"Erro ao executar {name}: {exc}"
+
+
+async def ask_ai(chat_id: int, user_message: str, history: list[dict] | None = None) -> str:
+    """Manda pergunta pra OpenAI com tools disponiveis. Retorna texto final."""
+    if not ai_client:
+        return (
+            "🤖 IA nao configurada.\n\n"
+            "O operador do bot precisa adicionar OPENAI_API_KEY como variavel de "
+            "ambiente. Por enquanto, use os comandos manuais: /menu, /filtros, /buscar."
+        )
+
+    radar = get_client(chat_id)
+    if not radar:
+        return "Cadastre sua chave do Radar DOU primeiro: /chave rdk_prod_xxx"
+
+    today_str = date.today().strftime("%Y-%m-%d (%A)")
+    system = AI_SYSTEM_PROMPT.format(today=today_str)
+
+    messages: list[dict[str, Any]] = [{"role": "system", "content": system}]
+    if history:
+        messages.extend(history[-12:])  # contexto recente
+    messages.append({"role": "user", "content": user_message})
+
+    try:
+        for _ in range(5):  # max 5 rodadas de tool calls
+            resp = await ai_client.chat.completions.create(
+                model=OPENAI_MODEL,
+                messages=messages,
+                tools=AI_TOOLS,
+                tool_choice="auto",
+                temperature=0.3,
+                max_tokens=900,
+            )
+            choice = resp.choices[0].message
+            tool_calls = choice.tool_calls or []
+
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": choice.content,
+                    "tool_calls": [
+                        {
+                            "id": tc.id,
+                            "type": "function",
+                            "function": {
+                                "name": tc.function.name,
+                                "arguments": tc.function.arguments,
+                            },
+                        }
+                        for tc in tool_calls
+                    ]
+                    if tool_calls
+                    else None,
+                }
+            )
+
+            if not tool_calls:
+                return choice.content or "(sem resposta da IA)"
+
+            for tc in tool_calls:
+                args_json = tc.function.arguments or "{}"
+                try:
+                    args = json.loads(args_json)
+                except json.JSONDecodeError:
+                    args = {}
+                result = await _exec_tool(tc.function.name, args, radar)
+                messages.append(
+                    {"role": "tool", "tool_call_id": tc.id, "content": result}
+                )
+
+        return "Nao consegui chegar a uma resposta apos 5 iteracoes. Tente reformular a pergunta."
+    except Exception as exc:
+        log.exception("erro chamando OpenAI")
+        return f"Erro na IA: {exc}"
+    finally:
+        try:
+            radar.close()
+        except Exception:
+            pass
+
+
+async def cmd_ia(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_html(
+            "<b>Assistente Virtual</b>\n\n"
+            "Uso: <code>/ia &lt;pergunta&gt;</code>\n\n"
+            "<b>Exemplos:</b>\n"
+            "• <code>/ia me mostra publicacoes de hoje sobre concursos</code>\n"
+            "• <code>/ia crie um alerta pra licitacoes de TI no DO3</code>\n"
+            "• <code>/ia o que tem do Banco Central na ultima semana?</code>\n"
+            "• <code>/ia quais alertas eu tenho?</code>\n\n"
+            "Pra conversa continua, use /conversar."
+        )
+        return
+
+    pergunta = " ".join(context.args)
+    chat_id = update.effective_chat.id
+    await update.message.chat.send_action(ChatAction.TYPING)
+    response = await ask_ai(chat_id, pergunta)
+    try:
+        await update.message.reply_text(response, parse_mode="Markdown")
+    except Exception:
+        await update.message.reply_text(response)
+
+
+# Conversacao continua via ConversationHandler
+CONV_AI = 100
+
+
+async def cmd_conversar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    if not get_client(chat_id):
+        await update.effective_message.reply_text(
+            "Cadastre sua chave primeiro: /chave rdk_prod_xxx"
+        )
+        return ConversationHandler.END
+    if not ai_client:
+        await update.effective_message.reply_text(
+            "🤖 IA nao configurada (OPENAI_API_KEY ausente). "
+            "Use /menu, /filtros ou /buscar enquanto isso."
+        )
+        return ConversationHandler.END
+
+    context.user_data["ai_history"] = []
+    await update.effective_message.reply_html(
+        "💬 <b>Modo conversação ativado</b>\n\n"
+        "Tudo que voce digitar agora vai pro Assistente Virtual com memória de contexto.\n\n"
+        "Mande <b>/sair</b> pra voltar ao bot normal."
+    )
+    return CONV_AI
+
+
+async def conv_on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    text = (update.message.text or "").strip()
+    if not text:
+        return CONV_AI
+
+    history = context.user_data.get("ai_history", [])
+    await update.message.chat.send_action(ChatAction.TYPING)
+    response = await ask_ai(chat_id, text, history)
+
+    history.append({"role": "user", "content": text})
+    history.append({"role": "assistant", "content": response})
+    context.user_data["ai_history"] = history[-24:]  # max 24 msgs
+
+    try:
+        await update.message.reply_text(response, parse_mode="Markdown")
+    except Exception:
+        await update.message.reply_text(response)
+    return CONV_AI
+
+
+async def conv_sair(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.pop("ai_history", None)
+    await update.effective_message.reply_text(
+        "Saiu do modo conversação. Bot voltou ao normal. /ajuda pra ver comandos."
+    )
+    return ConversationHandler.END
 
 
 # ---------------------------------------------------------------------------
@@ -987,6 +1366,22 @@ def main():
     app.add_handler(CommandHandler("favoritos", cmd_favoritos))
     app.add_handler(CommandHandler("ajuda", cmd_ajuda))
     app.add_handler(CommandHandler("help", cmd_ajuda))
+    app.add_handler(CommandHandler("ia", cmd_ia))
+
+    # Modo conversação contínua com a IA
+    conversar_conv = ConversationHandler(
+        entry_points=[CommandHandler("conversar", cmd_conversar)],
+        states={
+            CONV_AI: [MessageHandler(filters.TEXT & ~filters.COMMAND, conv_on_message)],
+        },
+        fallbacks=[
+            CommandHandler("sair", conv_sair),
+            CommandHandler("cancelar", conv_sair),
+        ],
+        per_chat=True,
+        per_user=True,
+    )
+    app.add_handler(conversar_conv)
 
     # Wizard /filtros (ConversationHandler) — registrado ANTES dos handlers
     # genéricos pra que ele consuma o input em estados ativos
