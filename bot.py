@@ -528,6 +528,13 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         next_page = int(data.split(":", 1)[1])
         fake = Update(update.update_id, message=query.message)
         await _ai_render_page(fake, chat_id, state["kwargs"], next_page)
+
+        # Usuario continua engajado com a IA — renova a janela de followup
+        # pra que a proxima mensagem em texto continue a conversa em vez de
+        # cair na busca convencional.
+        followup = context.user_data.get("ia_followup")
+        if followup:
+            followup["ts"] = datetime.now(timezone.utc).timestamp()
         return
 
     if data == "menu:hoje":
