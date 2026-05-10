@@ -381,7 +381,42 @@ async def on_plain_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
     if not text:
         return
+
+    # Se o usuario acabou de usar /ia (dentro da janela de 5 min), trata o
+    # texto como continuacao da conversa com a IA — assim o usuario pode
+    # responder naturalmente "sim, mostra" / "amplia pra ultimos 7 dias"
+    # sem precisar entrar em /conversar.
+    followup = context.user_data.get("ia_followup")
+    if followup:
+        elapsed = datetime.now(timezone.utc).timestamp() - followup.get("ts", 0)
+        if elapsed < IA_FOLLOWUP_WINDOW_SEC:
+            chat_id = update.effective_chat.id
+            history = followup.get("history", [])
+            await update.message.chat.send_action(ChatAction.TYPING)
+            response_text, pubs = await ask_ai(chat_id, text, history)
+            await _send_ai_response(update, response_text, pubs)
+            # Atualiza historico e timestamp
+            history.extend([
+                {"role": "user", "content": text},
+                {"role": "assistant", "content": response_text or ""},
+            ])
+            followup["history"] = history[-20:]  # max 20 msgs
+            followup["ts"] = datetime.now(timezone.utc).timestamp()
+            return
+        # Janela expirou — limpa pra cair na busca normal
+        context.user_data.pop("ia_followup", None)
+
     await _do_search_from_text(update, context, text)
+
+
+async def cmd_sair_ia(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Encerra a janela de continuacao pos-/ia (so faz sentido se ativa)."""
+    if context.user_data.pop("ia_followup", None):
+        await update.message.reply_text(
+            "Saiu da continuacao com a IA. Texto puro agora vira busca."
+        )
+    else:
+        await update.message.reply_text("Voce nao estava em modo IA.")
 
 
 async def _do_search_from_text(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
@@ -1070,6 +1105,9 @@ async def _send_ai_response(update: Update, response_text: str, pubs: list[dict]
             log.warning("erro ao renderizar card da publicacao: %s", exc)
 
 
+IA_FOLLOWUP_WINDOW_SEC = 300  # 5 min de janela pra continuar conversa apos /ia
+
+
 async def cmd_ia(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await update.message.reply_html(
@@ -1080,7 +1118,8 @@ async def cmd_ia(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "• <code>/ia crie um alerta pra licitacoes de TI no DO3</code>\n"
             "• <code>/ia o que tem do Banco Central na ultima semana?</code>\n"
             "• <code>/ia quais alertas eu tenho?</code>\n\n"
-            "Pra conversa continua, use /conversar."
+            "Apos a resposta, voce pode <b>continuar a conversa</b> por 5 min "
+            "(qualquer texto vai pra IA). Use /sair pra encerrar antes."
         )
         return
 
@@ -1089,6 +1128,15 @@ async def cmd_ia(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.chat.send_action(ChatAction.TYPING)
     response_text, pubs = await ask_ai(chat_id, pergunta)
     await _send_ai_response(update, response_text, pubs)
+
+    # Salva contexto pra continuacao automatica
+    context.user_data["ia_followup"] = {
+        "ts": datetime.now(timezone.utc).timestamp(),
+        "history": [
+            {"role": "user", "content": pergunta},
+            {"role": "assistant", "content": response_text or ""},
+        ],
+    }
 
 
 # Conversacao continua via ConversationHandler
@@ -1518,6 +1566,10 @@ def main():
         per_user=True,
     )
     app.add_handler(conversar_conv)
+
+    # /sair fora de /conversar: encerra a janela de followup pos-/ia.
+    # Precisa ficar DEPOIS do conversar_conv para não roubar o fallback dele.
+    app.add_handler(CommandHandler("sair", cmd_sair_ia))
 
     # Wizard /filtros (ConversationHandler) — registrado ANTES dos handlers
     # genéricos pra que ele consuma o input em estados ativos
