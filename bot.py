@@ -383,45 +383,35 @@ async def cmd_buscar(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def on_plain_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Qualquer texto puro (nao-comando) eh tratado como pergunta pra IA.
+
+    Pra busca direta no DOU sem IA, use /buscar <termo>.
+    """
     text = (update.message.text or "").strip()
     if not text:
         return
 
-    # Se o usuario acabou de usar /ia (dentro da janela de 5 min), trata o
-    # texto como continuacao da conversa com a IA — assim o usuario pode
-    # responder naturalmente "sim, mostra" / "amplia pra ultimos 7 dias"
-    # sem precisar entrar em /conversar.
-    followup = context.user_data.get("ia_followup")
-    if followup:
-        elapsed = datetime.now(timezone.utc).timestamp() - followup.get("ts", 0)
-        if elapsed < IA_FOLLOWUP_WINDOW_SEC:
-            chat_id = update.effective_chat.id
-            history = followup.get("history", [])
-            await update.message.chat.send_action(ChatAction.TYPING)
-            response_text, pubs, search_meta = await ask_ai(chat_id, text, history)
-            await _send_ai_response(update, response_text, pubs, search_meta)
-            # Atualiza historico e timestamp
-            history.extend([
-                {"role": "user", "content": text},
-                {"role": "assistant", "content": response_text or ""},
-            ])
-            followup["history"] = history[-20:]  # max 20 msgs
-            followup["ts"] = datetime.now(timezone.utc).timestamp()
-            return
-        # Janela expirou — limpa pra cair na busca normal
-        context.user_data.pop("ia_followup", None)
+    chat_id = update.effective_chat.id
+    history = context.user_data.get("ia_history", [])
+    await update.message.chat.send_action(ChatAction.TYPING)
+    response_text, pubs, search_meta = await ask_ai(chat_id, text, history)
+    await _send_ai_response(update, response_text, pubs, search_meta)
 
-    await _do_search_from_text(update, context, text)
+    history.extend([
+        {"role": "user", "content": text},
+        {"role": "assistant", "content": response_text or ""},
+    ])
+    context.user_data["ia_history"] = history[-20:]
 
 
 async def cmd_sair_ia(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Encerra a janela de continuacao pos-/ia (so faz sentido se ativa)."""
-    if context.user_data.pop("ia_followup", None):
+    """Limpa o historico da conversa com a IA (comeca do zero)."""
+    if context.user_data.pop("ia_history", None):
         await update.message.reply_text(
-            "Saiu da continuacao com a IA. Texto puro agora vira busca."
+            "Historico da IA limpo. A proxima mensagem comeca uma conversa nova."
         )
     else:
-        await update.message.reply_text("Voce nao estava em modo IA.")
+        await update.message.reply_text("Sem historico pra limpar.")
 
 
 async def _do_search_from_text(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
@@ -523,18 +513,11 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data.startswith("ai_page:"):
         state = AI_SEARCH_STATE.get(chat_id)
         if not state:
-            await query.message.reply_text("Sessão da IA expirou. Faça uma nova pergunta com /ia.")
+            await query.message.reply_text("Sessão da IA expirou. Faça uma nova pergunta.")
             return
         next_page = int(data.split(":", 1)[1])
         fake = Update(update.update_id, message=query.message)
         await _ai_render_page(fake, chat_id, state["kwargs"], next_page)
-
-        # Usuario continua engajado com a IA — renova a janela de followup
-        # pra que a proxima mensagem em texto continue a conversa em vez de
-        # cair na busca convencional.
-        followup = context.user_data.get("ia_followup")
-        if followup:
-            followup["ts"] = datetime.now(timezone.utc).timestamp()
         return
 
     if data == "menu:hoje":
@@ -1187,9 +1170,6 @@ async def _send_ai_response(
             )
 
 
-IA_FOLLOWUP_WINDOW_SEC = 300  # 5 min de janela pra continuar conversa apos /ia
-
-
 async def _ai_render_page(update: Update, chat_id: int, kwargs: dict, page: int):
     """Busca e renderiza uma pagina especifica de uma busca feita pela IA.
 
@@ -1257,34 +1237,36 @@ async def _ai_render_page(update: Update, chat_id: int, kwargs: dict, page: int)
 
 
 async def cmd_ia(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Comando /ia — equivalente a digitar a pergunta direto.
+
+    Mantido por retrocompatibilidade. Texto puro tambem vai pra IA agora.
+    """
     if not context.args:
         await update.message.reply_html(
             "<b>Assistente Virtual</b>\n\n"
-            "Uso: <code>/ia &lt;pergunta&gt;</code>\n\n"
+            "Pode escrever direto, sem <code>/ia</code> — qualquer texto "
+            "vai pra IA. Pra busca direta sem IA, use <code>/buscar</code>.\n\n"
             "<b>Exemplos:</b>\n"
-            "• <code>/ia me mostra publicacoes de hoje sobre concursos</code>\n"
-            "• <code>/ia crie um alerta pra licitacoes de TI no DO3</code>\n"
-            "• <code>/ia o que tem do Banco Central na ultima semana?</code>\n"
-            "• <code>/ia quais alertas eu tenho?</code>\n\n"
-            "Apos a resposta, voce pode <b>continuar a conversa</b> por 5 min "
-            "(qualquer texto vai pra IA). Use /sair pra encerrar antes."
+            "• me mostra publicacoes de hoje sobre concursos\n"
+            "• crie um alerta pra licitacoes de TI no DO3\n"
+            "• o que tem do Banco Central na ultima semana?\n"
+            "• quais alertas eu tenho?\n\n"
+            "Use /sair pra limpar o historico da conversa."
         )
         return
 
     pergunta = " ".join(context.args)
     chat_id = update.effective_chat.id
+    history = context.user_data.get("ia_history", [])
     await update.message.chat.send_action(ChatAction.TYPING)
-    response_text, pubs, search_meta = await ask_ai(chat_id, pergunta)
+    response_text, pubs, search_meta = await ask_ai(chat_id, pergunta, history)
     await _send_ai_response(update, response_text, pubs, search_meta)
 
-    # Salva contexto pra continuacao automatica
-    context.user_data["ia_followup"] = {
-        "ts": datetime.now(timezone.utc).timestamp(),
-        "history": [
-            {"role": "user", "content": pergunta},
-            {"role": "assistant", "content": response_text or ""},
-        ],
-    }
+    history.extend([
+        {"role": "user", "content": pergunta},
+        {"role": "assistant", "content": response_text or ""},
+    ])
+    context.user_data["ia_history"] = history[-20:]
 
 
 # Conversacao continua via ConversationHandler
@@ -1715,8 +1697,8 @@ def main():
     )
     app.add_handler(conversar_conv)
 
-    # /sair fora de /conversar: encerra a janela de followup pos-/ia.
-    # Precisa ficar DEPOIS do conversar_conv para não roubar o fallback dele.
+    # /sair fora de /conversar: limpa o historico da IA do chat.
+    # Precisa ficar DEPOIS do conversar_conv pra não roubar o fallback dele.
     app.add_handler(CommandHandler("sair", cmd_sair_ia))
 
     # Wizard /filtros (ConversationHandler) — registrado ANTES dos handlers
