@@ -66,7 +66,12 @@ API_KEY_RE = re.compile(r"^rdk_(prod|test)_[A-Za-z0-9]{32,}$")
 PAGE_SIZE = 5
 DEFAULT_LIMIT = 20
 
-SEARCH_STATE: dict[int, dict] = {}  # paginacao por chat_id
+# Paginacao das buscas convencionais (/buscar, /hoje, /filtros)
+SEARCH_STATE: dict[int, dict] = {}  # chat_id -> {filters, page, total, shown}
+
+# Paginacao das buscas feitas pela IA (10 por pagina, com botao "proxima")
+AI_PAGE_SIZE = 10
+AI_SEARCH_STATE: dict[int, dict] = {}  # chat_id -> {kwargs, total, page}
 
 # Cliente OpenAI (opcional — se nao tiver chave, comandos /ia e /conversar
 # devolvem mensagem amigavel pedindo pra configurar)
@@ -393,8 +398,8 @@ async def on_plain_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             chat_id = update.effective_chat.id
             history = followup.get("history", [])
             await update.message.chat.send_action(ChatAction.TYPING)
-            response_text, pubs = await ask_ai(chat_id, text, history)
-            await _send_ai_response(update, response_text, pubs)
+            response_text, pubs, search_meta = await ask_ai(chat_id, text, history)
+            await _send_ai_response(update, response_text, pubs, search_meta)
             # Atualiza historico e timestamp
             history.extend([
                 {"role": "user", "content": text},
@@ -513,6 +518,16 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         next_page = int(data.split(":", 1)[1])
         fake = Update(update.update_id, message=query.message)
         await _do_search(fake, context, chat_id, state["filters"], page=next_page)
+        return
+
+    if data.startswith("ai_page:"):
+        state = AI_SEARCH_STATE.get(chat_id)
+        if not state:
+            await query.message.reply_text("Sessão da IA expirou. Faça uma nova pergunta com /ia.")
+            return
+        next_page = int(data.split(":", 1)[1])
+        fake = Update(update.update_id, message=query.message)
+        await _ai_render_page(fake, chat_id, state["kwargs"], next_page)
         return
 
     if data == "menu:hoje":
@@ -899,20 +914,24 @@ async def _exec_tool(
     args: dict,
     radar: RadarDOU,
     pubs_to_render: list,
+    search_meta: dict | None = None,
 ) -> str:
     """Executa uma ferramenta solicitada pela IA. Retorna string textual com o resultado.
 
     pubs_to_render: lista mutavel onde acumulamos publicacoes que o bot vai
     renderizar como cards bonitos depois da resposta da IA.
+    search_meta: dict mutavel preenchido com {kwargs, total, page} pra
+    permitir paginacao via botao "Proxima pagina" depois.
     """
     try:
         if name == "buscar_publicacoes":
-            limit = min(int(args.pop("limit", 5)), 10)
+            # IA nao decide quantos itens mostrar — sempre 10 por pagina.
+            args.pop("limit", None)
+            args.pop("page", None)
             kwargs = {k: v for k, v in args.items() if v}
             if not kwargs:
                 return "Erro: pelo menos um filtro eh obrigatorio (query, date_from, etc)."
-            kwargs["limit"] = limit
-            res = radar.buscar(**kwargs)
+            res = radar.buscar(**kwargs, limit=AI_PAGE_SIZE, page=1)
             total = res["pagination"]["total"]
             items = res["data"]
             if not items:
@@ -924,6 +943,12 @@ async def _exec_tool(
             # Acumula pra renderizacao posterior
             pubs_to_render.extend(items)
 
+            # Salva estado pra paginacao (botao "Proxima pagina")
+            if search_meta is not None:
+                search_meta["kwargs"] = kwargs
+                search_meta["total"] = total
+                search_meta["page"] = 1
+
             # Resumo agregado pra IA processar (sem IDs ou detalhes que vao nos cards)
             datas = sorted({(p.get("data_publicacao") or "")[:10] for p in items if p.get("data_publicacao")})
             secoes = sorted({p.get("secao_codigo") or "?" for p in items})
@@ -931,15 +956,16 @@ async def _exec_tool(
             orgaos_set = {((p.get("orgao_hierarquia") or "").split("/")[-1] or "?") for p in items}
             orgaos_top = sorted(orgaos_set)[:5]
 
+            total_pages = -(-total // AI_PAGE_SIZE)
             lines = [
-                f"BUSCA OK. Total no banco: {total}. Cards mostrados: {len(items)}.",
+                f"BUSCA OK. Total no banco: {total} (pagina 1 de {total_pages}, {len(items)} itens nesta pagina).",
                 f"Datas: {', '.join(datas) or '-'}",
                 f"Secoes: {', '.join(secoes)}",
                 f"Tipos: {', '.join(tipos)}",
                 f"Orgaos (amostra): {', '.join(orgaos_top)}",
                 "",
-                "OBS: o bot ja vai mostrar os cards detalhados ao usuario. Voce so precisa "
-                "fazer um RESUMO curto (2-3 linhas) e oferecer uma proxima acao.",
+                "OBS: o bot vai mostrar os 10 cards desta pagina + um botao de paginacao. "
+                "Voce so precisa fazer um RESUMO curto (2-3 linhas) e oferecer uma proxima acao.",
             ]
             return "\n".join(lines)
 
@@ -997,11 +1023,12 @@ async def ask_ai(
     chat_id: int,
     user_message: str,
     history: list[dict] | None = None,
-) -> tuple[str, list[dict]]:
+) -> tuple[str, list[dict], dict]:
     """Manda pergunta pra OpenAI com tools disponiveis.
 
-    Retorna (texto_resposta, lista_de_publicacoes_pra_renderizar).
-    O bot vai enviar o texto + cards bonitos das publicacoes em sequencia.
+    Retorna (texto_resposta, lista_de_publicacoes, search_meta).
+    search_meta tem {kwargs, total, page} se a IA fez busca (vazio se nao).
+    O bot vai enviar o texto + cards bonitos + botao de paginacao se houver.
     """
     if not ai_client:
         return (
@@ -1009,11 +1036,12 @@ async def ask_ai(
             "O operador do bot precisa adicionar OPENAI_API_KEY como variavel de "
             "ambiente. Por enquanto, use os comandos manuais: /menu, /filtros, /buscar.",
             [],
+            {},
         )
 
     radar = get_client(chat_id)
     if not radar:
-        return ("Cadastre sua chave do Radar DOU primeiro: /chave rdk_prod_xxx", [])
+        return ("Cadastre sua chave do Radar DOU primeiro: /chave rdk_prod_xxx", [], {})
 
     date_hints = _build_date_hints()
     system = AI_SYSTEM_PROMPT.format(date_hints=date_hints)
@@ -1024,6 +1052,7 @@ async def ask_ai(
     messages.append({"role": "user", "content": user_message})
 
     pubs_to_render: list[dict] = []
+    search_meta: dict = {}
 
     try:
         for _ in range(5):
@@ -1059,7 +1088,7 @@ async def ask_ai(
             )
 
             if not tool_calls:
-                return (choice.content or "(sem resposta da IA)", pubs_to_render)
+                return (choice.content or "(sem resposta da IA)", pubs_to_render, search_meta)
 
             for tc in tool_calls:
                 args_json = tc.function.arguments or "{}"
@@ -1067,7 +1096,9 @@ async def ask_ai(
                     args = json.loads(args_json)
                 except json.JSONDecodeError:
                     args = {}
-                result = await _exec_tool(tc.function.name, args, radar, pubs_to_render)
+                result = await _exec_tool(
+                    tc.function.name, args, radar, pubs_to_render, search_meta
+                )
                 messages.append(
                     {"role": "tool", "tool_call_id": tc.id, "content": result}
                 )
@@ -1075,10 +1106,11 @@ async def ask_ai(
         return (
             "Nao consegui chegar a uma resposta apos 5 iteracoes. Tente reformular.",
             pubs_to_render,
+            search_meta,
         )
     except Exception as exc:
         log.exception("erro chamando OpenAI")
-        return (f"Erro na IA: {exc}", pubs_to_render)
+        return (f"Erro na IA: {exc}", pubs_to_render, search_meta)
     finally:
         try:
             radar.close()
@@ -1086,16 +1118,21 @@ async def ask_ai(
             pass
 
 
-async def _send_ai_response(update: Update, response_text: str, pubs: list[dict]):
-    """Envia o texto da IA e depois os cards das publicacoes (se houver)."""
+async def _send_ai_response(
+    update: Update,
+    response_text: str,
+    pubs: list[dict],
+    search_meta: dict | None = None,
+):
+    """Envia o texto da IA, os cards das publicacoes e o botao de paginacao."""
     if response_text:
         try:
             await update.effective_message.reply_text(response_text, parse_mode="Markdown")
         except Exception:
             await update.effective_message.reply_text(response_text)
 
-    # Renderiza cards bonitos das publicacoes que a IA buscou
-    for pub in pubs[:10]:
+    # Renderiza cards bonitos das publicacoes que a IA buscou (max 10 = 1 pagina)
+    for pub in pubs[:AI_PAGE_SIZE]:
         try:
             await update.effective_message.reply_html(
                 html_card(pub),
@@ -1104,8 +1141,97 @@ async def _send_ai_response(update: Update, response_text: str, pubs: list[dict]
         except Exception as exc:
             log.warning("erro ao renderizar card da publicacao: %s", exc)
 
+    # Salva estado de paginacao e mostra botao "Proxima pagina" se houver mais
+    if search_meta and search_meta.get("kwargs"):
+        chat_id = update.effective_chat.id
+        total = int(search_meta.get("total") or 0)
+        page = int(search_meta.get("page") or 1)
+        total_pages = max(1, -(-total // AI_PAGE_SIZE))
+        AI_SEARCH_STATE[chat_id] = {
+            "kwargs": search_meta["kwargs"],
+            "total": total,
+            "page": page,
+        }
+        if page < total_pages:
+            kb = InlineKeyboardMarkup([[
+                InlineKeyboardButton(
+                    f"⏭️ Proxima pagina ({page + 1}/{total_pages})",
+                    callback_data=f"ai_page:{page + 1}",
+                )
+            ]])
+            await update.effective_message.reply_text(
+                f"Pagina {page} de {total_pages} ({total} resultados no total).",
+                reply_markup=kb,
+            )
+
 
 IA_FOLLOWUP_WINDOW_SEC = 300  # 5 min de janela pra continuar conversa apos /ia
+
+
+async def _ai_render_page(update: Update, chat_id: int, kwargs: dict, page: int):
+    """Busca e renderiza uma pagina especifica de uma busca feita pela IA.
+
+    Usado pelo callback "Proxima pagina". Reusa os filtros salvos em
+    AI_SEARCH_STATE — nao chama a IA de novo.
+    """
+    radar = get_client(chat_id)
+    if not radar:
+        await update.effective_message.reply_text(
+            "Cadastre sua chave do Radar DOU primeiro: /chave rdk_prod_xxx"
+        )
+        return
+
+    try:
+        res = radar.buscar(**kwargs, limit=AI_PAGE_SIZE, page=page)
+    except Exception as exc:
+        log.exception("erro paginando busca da IA")
+        await update.effective_message.reply_text(f"Erro ao buscar pagina {page}: {exc}")
+        return
+    finally:
+        try:
+            radar.close()
+        except Exception:
+            pass
+
+    items = res.get("data") or []
+    total = int(res.get("pagination", {}).get("total") or 0)
+    total_pages = max(1, -(-total // AI_PAGE_SIZE))
+
+    if not items:
+        await update.effective_message.reply_text(
+            f"Pagina {page} vazia. (Total: {total})"
+        )
+        return
+
+    for pub in items:
+        try:
+            await update.effective_message.reply_html(
+                html_card(pub),
+                disable_web_page_preview=True,
+            )
+        except Exception as exc:
+            log.warning("erro ao renderizar card da publicacao: %s", exc)
+
+    AI_SEARCH_STATE[chat_id] = {
+        "kwargs": kwargs,
+        "total": total,
+        "page": page,
+    }
+    if page < total_pages:
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton(
+                f"⏭️ Proxima pagina ({page + 1}/{total_pages})",
+                callback_data=f"ai_page:{page + 1}",
+            )
+        ]])
+        await update.effective_message.reply_text(
+            f"Pagina {page} de {total_pages} ({total} resultados no total).",
+            reply_markup=kb,
+        )
+    else:
+        await update.effective_message.reply_text(
+            f"Fim dos resultados — pagina {page}/{total_pages} ({total} no total)."
+        )
 
 
 async def cmd_ia(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1126,8 +1252,8 @@ async def cmd_ia(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pergunta = " ".join(context.args)
     chat_id = update.effective_chat.id
     await update.message.chat.send_action(ChatAction.TYPING)
-    response_text, pubs = await ask_ai(chat_id, pergunta)
-    await _send_ai_response(update, response_text, pubs)
+    response_text, pubs, search_meta = await ask_ai(chat_id, pergunta)
+    await _send_ai_response(update, response_text, pubs, search_meta)
 
     # Salva contexto pra continuacao automatica
     context.user_data["ia_followup"] = {
@@ -1174,13 +1300,13 @@ async def conv_on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     history = context.user_data.get("ai_history", [])
     await update.message.chat.send_action(ChatAction.TYPING)
-    response_text, pubs = await ask_ai(chat_id, text, history)
+    response_text, pubs, search_meta = await ask_ai(chat_id, text, history)
 
     history.append({"role": "user", "content": text})
     history.append({"role": "assistant", "content": response_text})
     context.user_data["ai_history"] = history[-24:]
 
-    await _send_ai_response(update, response_text, pubs)
+    await _send_ai_response(update, response_text, pubs, search_meta)
     return CONV_AI
 
 
