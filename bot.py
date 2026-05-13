@@ -1610,8 +1610,25 @@ async def _check_alerts_for_user(
             res = client.listar_alertas()
         except Exception as exc:
             msg = str(exc).lower()
-            if "permiss" in msg or "scope" in msg:
-                log.info("[alerts-job] chat_id=%s sem permissao de alertas", chat_id)
+            # Erros nao-fatais: usuario sem permissao/scope OU plano inativo
+            # (trial expirado, assinatura cancelada, plano sem API). A API
+            # devolve 401/403 com mensagem clara — tratamos silenciosamente
+            # pra nao spammar logs e pra que o bot pare de tentar mandar
+            # alertas pra esse usuario ate ele regularizar.
+            non_fatal_markers = (
+                "permiss", "scope",        # falta de scope na key
+                "trial expirado",          # FREE com trial vencido
+                "assinatura inativa",      # subscription cancelada/past_due
+                "plano atual nao inclui",  # plano sem direito a API
+                "plano atual não inclui",
+                "acesso a api indisponivel",
+                "acesso à api indisponível",
+            )
+            if any(m in msg for m in non_fatal_markers):
+                log.info(
+                    "[alerts-job] chat_id=%s plano/permissao bloqueia alertas: %s",
+                    chat_id, exc,
+                )
                 return
             raise
 
